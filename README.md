@@ -51,6 +51,15 @@ direct links box. Both accept URLs separated by newlines, commas, spaces, or
 any mixture. Duplicates across the two sources are removed while preserving
 order. Malformed entries remain visible as `Invalid` and are skipped.
 
+## Searching for videos
+
+The **Search** tab searches YouTube, SoundCloud, Bilibili, Niconico, or Yahoo
+Video through yt-dlp's search extractors, so no API keys are needed. Results
+show a thumbnail, title, uploader, duration, and view count. Tick the rows you
+want and press **Add selected to queue** (or double-click a single row) to
+append them to the direct links box; links already queued are skipped. Pasting
+a URL into the search field adds it directly.
+
 ## System tray
 
 Closing the window minimises the app to the system tray. Click the tray icon

@@ -12,8 +12,9 @@ from queue import Empty, Queue
 from typing import Any
 from urllib.parse import urlparse
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont, QIcon, QPalette
+from PySide6.QtCore import QByteArray, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest, QSslSocket
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from downloader import DownloadConfig, DownloadJob, DownloadManager, find_ffmpeg, yt_dlp
+from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -118,6 +120,9 @@ QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #3d444d; bor
 QCheckBox::indicator:hover { border-color: #8b949e; }
 QCheckBox::indicator:checked { background: #1f6feb; border-color: #58a6ff; image: url(@ui/check.png); }
 QCheckBox::indicator:checked:hover { background: #388bfd; }
+QTableWidget::indicator { width: 16px; height: 16px; border: 1px solid #3d444d; border-radius: 4px; background: #0d1117; }
+QTableWidget::indicator:hover { border-color: #8b949e; }
+QTableWidget::indicator:checked { background: #1f6feb; border-color: #58a6ff; image: url(@ui/check.png); }
 
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #30363d; border-radius: 4px; min-height: 24px; }
@@ -230,9 +235,26 @@ def app_icon() -> QIcon:
     return QIcon()
 
 
+class SearchWorker(QThread):
+    finished_ok = Signal(int, list)
+    failed = Signal(int, str)
+
+    def __init__(self, generation: int, query: str, prefix: str, limit: int, logger: logging.Logger) -> None:
+        super().__init__()
+        self.generation, self.query, self.prefix, self.limit, self.logger = generation, query, prefix, limit, logger
+
+    def run(self) -> None:
+        try:
+            self.finished_ok.emit(self.generation, search_videos(self.query, self.prefix, self.limit, self.logger))
+        except Exception as exc:
+            self.failed.emit(self.generation, str(exc).strip() or exc.__class__.__name__)
+
+
 class MainWindow(QMainWindow):
     JOB_COLS = ("#", "Video", "Progress", "Details", "Status", "")
     HIST_COLS = ("Time", "Title", "Status", "URL", "Output / Error")
+    SEARCH_COLS = ("", "", "Title", "Uploader", "Duration", "Views")
+    THUMB_SIZE = QSize(96, 54)
 
     def __init__(self) -> None:
         super().__init__()
@@ -252,6 +274,11 @@ class MainWindow(QMainWindow):
         self._exiting = False
         self._tray_hint_shown = False
         self.tray: QSystemTrayIcon | None = None
+        self.search_results: list[SearchResult] = []
+        self._search_worker: SearchWorker | None = None
+        self._search_generation = 0
+        self._net = QNetworkAccessManager(self)
+        self._thumb_cache: dict[str, QPixmap] = {}
 
         self._build_ui()
         self._build_tray()
@@ -285,6 +312,7 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_downloads_tab(), "Downloads")
+        self.tabs.addTab(self._build_search_tab(), "Search")
         self.tabs.addTab(self._build_history_tab(), "History")
         self.tabs.addTab(self._build_settings_tab(), "Settings")
         layout.addWidget(self.tabs, 1)
@@ -375,6 +403,232 @@ class MainWindow(QMainWindow):
         self.jobs_table.verticalHeader().setDefaultSectionSize(36)
         layout.addWidget(self.jobs_table, 1)
         return page
+
+    def _build_search_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search for videos…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.returnPressed.connect(self._run_search)
+        self.search_site = QComboBox()
+        for name, key in SEARCH_SITES:
+            self.search_site.addItem(name, key)
+        self.search_site.setMinimumWidth(140)
+        self.search_limit = QSpinBox()
+        self.search_limit.setRange(1, MAX_RESULTS)
+        self.search_limit.setValue(int(self.settings.get("search_limit", 15)))
+        self.search_limit.setSuffix(" results")
+        self.search_limit.setMinimumWidth(110)
+        self.search_btn = QPushButton("Search")
+        self.search_btn.setObjectName("primary")
+        self.search_btn.clicked.connect(self._run_search)
+        bar.addWidget(self.search_edit, 1)
+        bar.addWidget(self.search_site)
+        bar.addWidget(self.search_limit)
+        bar.addWidget(self.search_btn)
+        layout.addLayout(bar)
+
+        self.search_table = QTableWidget(0, len(self.SEARCH_COLS))
+        self.search_table.setHorizontalHeaderLabels(self.SEARCH_COLS)
+        self.search_table.verticalHeader().setVisible(False)
+        self.search_table.verticalHeader().setDefaultSectionSize(62)
+        self.search_table.setAlternatingRowColors(True)
+        self.search_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.search_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.search_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.search_table.setShowGrid(False)
+        self.search_table.setWordWrap(False)
+        self.search_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.search_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        h = self.search_table.horizontalHeader()
+        for col, mode in enumerate((QHeaderView.ResizeMode.Fixed, QHeaderView.ResizeMode.Fixed, QHeaderView.ResizeMode.Stretch,
+                                    QHeaderView.ResizeMode.Interactive, QHeaderView.ResizeMode.Fixed, QHeaderView.ResizeMode.Fixed)):
+            h.setSectionResizeMode(col, mode)
+        h.resizeSection(0, 36)
+        h.resizeSection(1, self.THUMB_SIZE.width() + 16)
+        h.resizeSection(3, 200)
+        h.resizeSection(4, 90)
+        h.resizeSection(5, 80)
+        h.setStretchLastSection(False)
+        self.search_table.cellDoubleClicked.connect(self._search_row_double_clicked)
+        self.search_table.itemChanged.connect(lambda _item: self._update_search_selection())
+        layout.addWidget(self.search_table, 1)
+
+        footer = QHBoxLayout()
+        self.search_status = QLabel("Enter a query to search YouTube and other supported sites.")
+        self.search_status.setObjectName("muted")
+        footer.addWidget(self.search_status, 1)
+        select_all = QPushButton("Select all")
+        select_all.clicked.connect(lambda: self._set_all_search_checks(True))
+        select_none = QPushButton("Select none")
+        select_none.clicked.connect(lambda: self._set_all_search_checks(False))
+        self.add_selected_btn = QPushButton("Add selected to queue")
+        self.add_selected_btn.setObjectName("primary")
+        self.add_selected_btn.setEnabled(False)
+        self.add_selected_btn.clicked.connect(self._add_selected_results)
+        for btn in (select_all, select_none, self.add_selected_btn):
+            footer.addWidget(btn)
+        layout.addLayout(footer)
+        return page
+
+    # -------------------------------------------------------------- search
+    def _run_search(self) -> None:
+        query = self.search_edit.text().strip()
+        if not query:
+            return
+        if is_basic_url(query):
+            self._append_direct(query)
+            self.search_status.setText("That looks like a link — added it to the direct links box.")
+            self.tabs.setCurrentIndex(0)
+            return
+        self._search_generation += 1
+        prefix = self.search_site.currentData()
+        self.search_btn.setEnabled(False)
+        self.search_btn.setText("Searching…")
+        self.search_status.setText(f"Searching {self.search_site.currentText()} for “{query}”…")
+        worker = SearchWorker(self._search_generation, query, prefix, self.search_limit.value(), self.logger)
+        worker.finished_ok.connect(self._search_finished)
+        worker.failed.connect(self._search_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._search_worker = worker
+        worker.start()
+
+    def _search_done(self) -> None:
+        self.search_btn.setEnabled(True)
+        self.search_btn.setText("Search")
+
+    def _search_finished(self, generation: int, results: list) -> None:
+        if generation != self._search_generation:
+            return
+        self._search_done()
+        self.search_results = list(results)
+        self._render_search_results()
+        site = self.search_site.currentText()
+        self.search_status.setText(f"{len(results)} result{'s' if len(results) != 1 else ''} from {site}." if results else f"No results on {site}.")
+
+    def _search_failed(self, generation: int, error: str) -> None:
+        if generation != self._search_generation:
+            return
+        self._search_done()
+        self.search_status.setText(f"Search failed: {error}")
+        self.logger.error("Search failed: %s", error)
+
+    def _render_search_results(self) -> None:
+        table = self.search_table
+        table.blockSignals(True)
+        table.setRowCount(0)
+        table.setRowCount(len(self.search_results))
+        for row, result in enumerate(self.search_results):
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            check.setCheckState(Qt.CheckState.Unchecked)
+            table.setItem(row, 0, check)
+            thumb = QLabel()
+            thumb.setFixedSize(self.THUMB_SIZE)
+            thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb.setStyleSheet("background: #21262d; border-radius: 4px;")
+            wrapper = QWidget()
+            wl = QHBoxLayout(wrapper)
+            wl.setContentsMargins(8, 4, 8, 4)
+            wl.addWidget(thumb)
+            table.setCellWidget(row, 1, wrapper)
+            self._load_thumbnail(result.thumbnail, thumb)
+            title = QTableWidgetItem(result.title)
+            title.setToolTip(f"{result.title}\n{result.url}")
+            table.setItem(row, 2, title)
+            uploader = QTableWidgetItem(result.uploader)
+            uploader.setForeground(QColor(MUTED))
+            table.setItem(row, 3, uploader)
+            duration = QTableWidgetItem(format_duration(result.duration))
+            duration.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            duration.setFont(MONO_FONT())
+            table.setItem(row, 4, duration)
+            views = QTableWidgetItem(format_views(result.view_count))
+            views.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            views.setFont(MONO_FONT())
+            table.setItem(row, 5, views)
+        table.blockSignals(False)
+        self._update_search_selection()
+
+    def _load_thumbnail(self, url: str, label: QLabel) -> None:
+        if not url:
+            return
+        cached = self._thumb_cache.get(url)
+        if cached is not None:
+            label.setPixmap(cached)
+            return
+        reply = self._net.get(QNetworkRequest(QUrl(url)))
+
+        def done() -> None:
+            try:
+                if reply.error() == QNetworkReply.NetworkError.NoError:
+                    pixmap = QPixmap()
+                    if pixmap.loadFromData(reply.readAll()):
+                        scaled = pixmap.scaled(self.THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                        x = max(0, (scaled.width() - self.THUMB_SIZE.width()) // 2)
+                        y = max(0, (scaled.height() - self.THUMB_SIZE.height()) // 2)
+                        cropped = scaled.copy(x, y, self.THUMB_SIZE.width(), self.THUMB_SIZE.height())
+                        self._thumb_cache[url] = cropped
+                        try:
+                            label.setPixmap(cropped)
+                        except RuntimeError:
+                            pass
+            finally:
+                reply.deleteLater()
+
+        reply.finished.connect(done)
+
+    def _checked_results(self) -> list[SearchResult]:
+        picked = []
+        for row, result in enumerate(self.search_results):
+            item = self.search_table.item(row, 0)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                picked.append(result)
+        return picked
+
+    def _update_search_selection(self) -> None:
+        count = len(self._checked_results())
+        self.add_selected_btn.setEnabled(count > 0)
+        self.add_selected_btn.setText(f"Add {count} to queue" if count else "Add selected to queue")
+
+    def _set_all_search_checks(self, checked: bool) -> None:
+        self.search_table.blockSignals(True)
+        for row in range(self.search_table.rowCount()):
+            item = self.search_table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.search_table.blockSignals(False)
+        self._update_search_selection()
+
+    def _search_row_double_clicked(self, row: int, _col: int) -> None:
+        if 0 <= row < len(self.search_results):
+            self._queue_results([self.search_results[row]])
+
+    def _add_selected_results(self) -> None:
+        self._queue_results(self._checked_results())
+
+    def _queue_results(self, results: list[SearchResult]) -> None:
+        if not results:
+            return
+        existing = set(self._collect_urls())
+        new_urls = [r.url for r in results if r.url not in existing]
+        if new_urls:
+            self._append_direct("\n".join(new_urls))
+            self._reload_links()
+        skipped = len(results) - len(new_urls)
+        msg = f"Added {len(new_urls)} link{'s' if len(new_urls) != 1 else ''} to the queue"
+        if skipped:
+            msg += f" ({skipped} already queued)"
+        self.search_status.setText(msg + ".")
+        self.status_label.setText(msg + ".")
+        self._set_all_search_checks(False)
+        self.tabs.setCurrentIndex(0)
 
     def _build_history_tab(self) -> QWidget:
         page = QWidget()
@@ -756,6 +1010,7 @@ class MainWindow(QMainWindow):
             "workers": self.workers_spin.value(),
             "skip_existing": self.skip_check.isChecked(),
             "ffmpeg_path": self.ffmpeg_edit.text(),
+            "search_limit": self.search_limit.value(),
         }
         try:
             SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -925,6 +1180,13 @@ class MainWindow(QMainWindow):
         QApplication.instance().quit()
 
 
+def configure_tls() -> None:
+    # Qt's OpenSSL backend crashes once Python's own OpenSSL (ssl / yt-dlp) is loaded in-process;
+    # the native backend has no such conflict. Falls through silently on non-Windows.
+    if sys.platform == "win32" and "schannel" in QSslSocket.availableBackends():
+        QSslSocket.setActiveBackend("schannel")
+
+
 def apply_theme(app: QApplication) -> None:
     app.setStyle("Fusion")
     base = QFont()
@@ -959,6 +1221,7 @@ def main() -> None:
     app.setApplicationName("Video Batch Downloader")
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
+    configure_tls()
     apply_theme(app)
     window = MainWindow()
     window.show()
