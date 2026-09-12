@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# App runtime data
+downloads/
+download.log
+download_history.json
+settings.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Legacy backup of the CustomTkinter UI
+app_customtkinter_backup.py
