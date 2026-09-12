@@ -11,10 +11,12 @@ from pathlib import Path
 from queue import Queue
 from typing import Any, Callable, Optional
 
+YT_DLP_IMPORT_ERROR = ""
 try:
     import yt_dlp
-except ImportError:  # The GUI can show a useful install message.
+except Exception as _exc:  # The GUI shows the reason instead of a bare "missing".
     yt_dlp = None  # type: ignore[assignment]
+    YT_DLP_IMPORT_ERROR = f"{_exc.__class__.__name__}: {_exc}"
 
 
 @dataclass

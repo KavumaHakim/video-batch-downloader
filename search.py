@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 try:
     import yt_dlp
-except ImportError:
+except Exception:
     yt_dlp = None  # type: ignore[assignment]
 
 

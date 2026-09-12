@@ -21,17 +21,20 @@ from PySide6.QtWidgets import (
     QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from downloader import DownloadConfig, DownloadJob, DownloadManager, find_ffmpeg, yt_dlp
+from downloader import YT_DLP_IMPORT_ERROR, DownloadConfig, DownloadJob, DownloadManager, find_ffmpeg, yt_dlp
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
 
 
-APP_DIR = Path(__file__).resolve().parent
+FROZEN = bool(getattr(sys, "frozen", False))
+# Bundled read-only assets live in the PyInstaller extraction dir; user data sits next to the exe.
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "settings.json"
 LOG_FILE = APP_DIR / "download.log"
 HISTORY_FILE = APP_DIR / "download_history.json"
-ICON_ICO = APP_DIR / "assets" / "app_icon.ico"
-ICON_PNG = APP_DIR / "assets" / "app_icon.png"
-UI_ASSETS = APP_DIR / "assets" / "ui"
+ICON_ICO = BUNDLE_DIR / "assets" / "app_icon.ico"
+ICON_PNG = BUNDLE_DIR / "assets" / "app_icon.png"
+UI_ASSETS = BUNDLE_DIR / "assets" / "ui"
 
 TERMINAL = {"Completed", "Failed", "Cancelled", "Skipped"}
 RETRYABLE = {"Failed", "Cancelled"}
@@ -969,7 +972,9 @@ class MainWindow(QMainWindow):
     def _check_tools(self) -> None:
         ffmpeg = find_ffmpeg(self.ffmpeg_edit.text().strip())
         if yt_dlp is None:
-            self.tool_label.setText("yt-dlp is missing — run: uv sync")
+            self.tool_label.setText(f"yt-dlp failed to load — {YT_DLP_IMPORT_ERROR}" if YT_DLP_IMPORT_ERROR else "yt-dlp is missing — run: uv sync")
+            self.tool_label.setToolTip(YT_DLP_IMPORT_ERROR)
+            self.logger.error("yt-dlp import failed: %s", YT_DLP_IMPORT_ERROR)
             self.tool_label.setStyleSheet(f"color: {STATUS_COLORS['Failed']}")
         elif not ffmpeg:
             self.tool_label.setText("FFmpeg was not found. Separate video/audio streams may not merge correctly.")

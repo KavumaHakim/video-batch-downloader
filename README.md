@@ -99,6 +99,22 @@ uses retries for temporary failures, and merges to MP4 when FFmpeg is
 available. Existing final files can be skipped; `.part` files alone are not
 treated as completed files.
 
+## Building a standalone executable
+
+```powershell
+.uild.ps1
+```
+
+This runs PyInstaller with `VideoBatchDownloader.spec` and produces
+`dist\VideoBatchDownloader.exe`, a single windowed executable (about 55 MB)
+that needs no Python install. Settings, history, the log, and the default
+`downloads` folder are created next to the exe. FFmpeg is not bundled: keep it
+on `PATH` or point the FFmpeg path setting at it.
+
+The spec pins the OpenSSL DLLs from the build interpreter and excludes Qt's
+OpenSSL plugin; without that, a same-named `libssl-3-x64.dll` earlier on
+`PATH` (Git's `mingw64in`, for example) can get bundled and break `ssl`.
+
 ## Troubleshooting
 
 - If the app says yt-dlp is missing, run `uv sync` and launch with

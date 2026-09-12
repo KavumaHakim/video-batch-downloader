@@ -18,3 +18,7 @@ Thumbs.db
 
 # Legacy backup of the CustomTkinter UI
 app_customtkinter_backup.py
+
+# PyInstaller output
+build/
+dist/
