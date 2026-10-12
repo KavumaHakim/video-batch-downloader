@@ -21,7 +21,10 @@ from PySide6.QtWidgets import (
     QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from downloader import YT_DLP_IMPORT_ERROR, DownloadConfig, DownloadJob, DownloadManager, find_ffmpeg, yt_dlp
+from downloader import (
+    AUDIO_FORMATS, LOSSLESS_AUDIO, YT_DLP_IMPORT_ERROR, DownloadConfig, DownloadJob, DownloadManager,
+    find_ffmpeg, yt_dlp,
+)
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
 
 
@@ -49,6 +52,17 @@ STATUS_COLORS = {
 }
 TEXT = "#c9d1d9"
 MUTED = "#8b949e"
+
+# Combo label -> DownloadConfig.audio_format ("" keeps the video pipeline).
+FORMAT_CHOICES: list[tuple[str, str]] = [
+    ("Video (MP4)", ""),
+    ("Audio: MP3", "mp3"),
+    ("Audio: M4A", "m4a"),
+    ("Audio: Opus", "opus"),
+    ("Audio: FLAC", "flac"),
+    ("Audio: WAV", "wav"),
+]
+AUDIO_BITRATES = ["320", "256", "192", "128", "96"]
 
 
 def MONO_FONT() -> QFont:
@@ -324,6 +338,17 @@ class MainWindow(QMainWindow):
         self.summary_label = QLabel()
         self.summary_label.setObjectName("muted")
         bottom.addWidget(self.summary_label, 1)
+        format_label = QLabel("Format")
+        format_label.setObjectName("muted")
+        bottom.addWidget(format_label)
+        self.format_box = QComboBox()
+        for label, _codec in FORMAT_CHOICES:
+            self.format_box.addItem(label)
+        self.format_box.setCurrentText(self.settings.get("format", FORMAT_CHOICES[0][0]))
+        self.format_box.setMinimumWidth(130)
+        self.format_box.setToolTip("Audio formats extract the soundtrack with FFmpeg")
+        self.format_box.currentTextChanged.connect(self._format_changed)
+        bottom.addWidget(self.format_box)
         self.retry_btn = QPushButton("Retry failed")
         self.retry_btn.setObjectName("warn")
         self.retry_btn.setEnabled(False)
@@ -340,9 +365,16 @@ class MainWindow(QMainWindow):
             bottom.addWidget(btn)
         layout.addLayout(bottom)
 
+        status_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("muted")
-        layout.addWidget(self.status_label)
+        status_row.addWidget(self.status_label, 1)
+        self.format_hint = QLabel()
+        self.format_hint.setObjectName("muted")
+        self.format_hint.setVisible(False)
+        status_row.addWidget(self.format_hint)
+        layout.addLayout(status_row)
+        self._format_changed()
         self._update_summary()
 
     def _build_downloads_tab(self) -> QWidget:
@@ -708,6 +740,9 @@ class MainWindow(QMainWindow):
         self.quality_box = QComboBox()
         self.quality_box.addItems(["Best available", "2160p", "1440p", "1080p", "720p", "480p", "360p"])
         self.quality_box.setCurrentText(self.settings.get("quality", "Best available"))
+        self.bitrate_box = QComboBox()
+        self.bitrate_box.addItems([f"{rate} kbps" for rate in AUDIO_BITRATES])
+        self.bitrate_box.setCurrentText(f"{self.settings.get('audio_quality', '192')} kbps")
         self.mode_box = QComboBox()
         self.mode_box.addItems(["Sequential", "Parallel"])
         self.mode_box.setCurrentText(self.settings.get("mode", "Parallel"))
@@ -717,8 +752,10 @@ class MainWindow(QMainWindow):
         self.workers_spin.setValue(int(self.settings.get("workers", 3)))
         self.skip_check = QCheckBox("Skip files that already exist in the output folder")
         self.skip_check.setChecked(bool(self.settings.get("skip_existing", True)))
-        form.addWidget(QLabel("Quality"), 0, 0)
+        self.quality_label = QLabel("Quality")
+        form.addWidget(self.quality_label, 0, 0)
         form.addWidget(self.quality_box, 0, 1)
+        form.addWidget(self.bitrate_box, 0, 1)
         form.addWidget(QLabel("Mode"), 0, 2)
         form.addWidget(self.mode_box, 0, 3)
         form.addWidget(QLabel("Workers"), 0, 4)
@@ -728,7 +765,10 @@ class MainWindow(QMainWindow):
         form.setColumnStretch(3, 1)
         layout.addWidget(opts)
 
-        note = QLabel("Quality is a maximum height; lower-resolution sources are never upscaled. Settings are saved when a download starts and on exit.")
+        note = QLabel("Video quality is a maximum height; lower-resolution sources are never upscaled. "
+                      "Audio formats download the best available audio stream and convert it with FFmpeg "
+                      "(FLAC and WAV are lossless, so bitrate does not apply). "
+                      "Settings are saved when a download starts and on exit.")
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -872,6 +912,10 @@ class MainWindow(QMainWindow):
         self.retry_btn.setEnabled(retryable)
 
     # ------------------------------------------------------------- actions
+    def _audio_format(self) -> str:
+        label = self.format_box.currentText()
+        return next((codec for name, codec in FORMAT_CHOICES if name == label), "")
+
     def _config(self) -> DownloadConfig:
         return DownloadConfig(
             Path(self.output_edit.text()).expanduser(),
@@ -880,7 +924,26 @@ class MainWindow(QMainWindow):
             self.workers_spin.value(),
             self.skip_check.isChecked(),
             self.ffmpeg_edit.text().strip(),
+            self._audio_format(),
+            self.bitrate_box.currentText().split()[0],
         )
+
+    def _format_changed(self, _: str = "") -> None:
+        codec = self._audio_format()
+        audio = bool(codec)
+        self.quality_box.setVisible(not audio)
+        self.bitrate_box.setVisible(audio)
+        self.bitrate_box.setEnabled(codec not in LOSSLESS_AUDIO)
+        self.quality_label.setText("Bitrate" if audio else "Quality")
+        self.format_hint.setVisible(audio)
+        if audio:
+            ext = AUDIO_FORMATS[codec]
+            if find_ffmpeg(self.ffmpeg_edit.text().strip()):
+                self.format_hint.setText(f"Saving as .{ext}")
+                self.format_hint.setStyleSheet(f"color: {MUTED}")
+            else:
+                self.format_hint.setText(f".{ext} needs FFmpeg — not found")
+                self.format_hint.setStyleSheet(f"color: {STATUS_COLORS['Cancelled']}")
 
     def _start(self) -> None:
         self._reload_links()
@@ -996,6 +1059,7 @@ class MainWindow(QMainWindow):
         if path:
             self.ffmpeg_edit.setText(path)
             self._check_tools()
+            self._format_changed()
 
     def _mode_changed(self, _: str = "") -> None:
         self.workers_spin.setEnabled(self.mode_box.currentText() == "Parallel")
@@ -1011,6 +1075,8 @@ class MainWindow(QMainWindow):
         data = {
             "output_folder": self.output_edit.text(),
             "quality": self.quality_box.currentText(),
+            "format": self.format_box.currentText(),
+            "audio_quality": self.bitrate_box.currentText().split()[0],
             "mode": self.mode_box.currentText(),
             "workers": self.workers_spin.value(),
             "skip_existing": self.skip_check.isChecked(),

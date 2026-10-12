@@ -34,6 +34,11 @@ class DownloadJob:
     error: str = ""
 
 
+# Codec -> container extension yt-dlp writes after FFmpegExtractAudio.
+AUDIO_FORMATS = {"mp3": "mp3", "m4a": "m4a", "opus": "opus", "wav": "wav", "flac": "flac"}
+LOSSLESS_AUDIO = {"wav", "flac"}
+
+
 @dataclass
 class DownloadConfig:
     output_dir: Path
@@ -42,6 +47,16 @@ class DownloadConfig:
     workers: int = 3
     skip_existing: bool = True
     ffmpeg_path: str = ""
+    audio_format: str = ""       # "" = video; otherwise an AUDIO_FORMATS key
+    audio_quality: str = "192"   # kbps, ignored for lossless codecs
+
+    @property
+    def audio_only(self) -> bool:
+        return bool(self.audio_format)
+
+    @property
+    def target_ext(self) -> str:
+        return AUDIO_FORMATS.get(self.audio_format, "mp4") if self.audio_only else "mp4"
 
 
 class DownloadManager:
@@ -66,6 +81,11 @@ class DownloadManager:
             raise RuntimeError("yt-dlp is not installed. Run: pip install -r requirements.txt")
         if self.active:
             raise RuntimeError("A download batch is already running.")
+        if config.audio_only and not find_ffmpeg(config.ffmpeg_path):
+            raise RuntimeError(
+                f"Converting to {config.audio_format.upper()} needs FFmpeg, which was not found. "
+                "Install FFmpeg and put it on PATH, or set the FFmpeg path in Settings."
+            )
 
         config.output_dir.mkdir(parents=True, exist_ok=True)
         self.cancel_event.clear()
@@ -107,8 +127,8 @@ class DownloadManager:
                 if info and info.get("title"):
                     job.title = str(info["title"])
                     self._emit({"type": "metadata", "job_id": job.job_id, "title": job.title})
-                if config.skip_existing and self._existing_output(ydl, info, config.output_dir):
-                    job.output_path = str(self._prepared_path(ydl, info, config.output_dir))
+                if config.skip_existing and self._existing_output(ydl, info, config):
+                    job.output_path = str(self._prepared_path(ydl, info, config.output_dir, config.target_ext))
                     self._status(job, "Skipped")
                     self.logger.info("Skipped existing file: %s", job.url)
                     return
@@ -130,10 +150,7 @@ class DownloadManager:
                 self.logger.error("Failed: %s | %s", job.url, job.error)
 
     def _options(self, job: DownloadJob, config: DownloadConfig) -> dict[str, Any]:
-        quality = self._format_for(config.quality)
         options: dict[str, Any] = {
-            "format": quality,
-            "merge_output_format": "mp4",
             "outtmpl": str(config.output_dir / "%(title)s.%(ext)s"),
             "windowsfilenames": True,
             "restrictfilenames": False,
@@ -142,13 +159,37 @@ class DownloadManager:
             "retries": 5,
             "fragment_retries": 5,
             "progress_hooks": [self._progress_hook(job)],
+            "postprocessor_hooks": [self._postprocessor_hook(job)],
             "quiet": True,
             "no_warnings": True,
             "logger": self.logger,
         }
+        if config.audio_only:
+            options["format"] = "ba/b"
+            postprocessor: dict[str, Any] = {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": config.audio_format,
+            }
+            if config.audio_format not in LOSSLESS_AUDIO:
+                postprocessor["preferredquality"] = config.audio_quality
+            options["postprocessors"] = [postprocessor]
+        else:
+            options["format"] = self._format_for(config.quality)
+            options["merge_output_format"] = "mp4"
         if config.ffmpeg_path:
             options["ffmpeg_location"] = config.ffmpeg_path
         return options
+
+    def _postprocessor_hook(self, job: DownloadJob) -> Callable[[dict[str, Any]], None]:
+        def hook(data: dict[str, Any]) -> None:
+            # Postprocessing renames the file (merge, audio extraction), so the path
+            # recorded by the progress hook is stale by the time the job finishes.
+            if data.get("status") != "finished":
+                return
+            path = (data.get("info_dict") or {}).get("filepath")
+            if path:
+                job.output_path = str(path)
+        return hook
 
     @staticmethod
     def _format_for(quality: str) -> str:
@@ -182,19 +223,17 @@ class DownloadManager:
         return hook
 
     @staticmethod
-    def _prepared_path(ydl: Any, info: dict[str, Any], output_dir: Path) -> Path:
+    def _prepared_path(ydl: Any, info: dict[str, Any], output_dir: Path, ext: str = "") -> Path:
         path = Path(ydl.prepare_filename(info))
         if path.parent != output_dir:
             path = output_dir / path.name
-        return path
+        return path.with_suffix(f".{ext}") if ext else path
 
-    def _existing_output(self, ydl: Any, info: dict[str, Any], output_dir: Path) -> bool:
+    def _existing_output(self, ydl: Any, info: dict[str, Any], config: DownloadConfig) -> bool:
         if not info:
             return False
-        prepared = self._prepared_path(ydl, info, output_dir)
-        candidates = {prepared}
-        if prepared.suffix.lower() != ".mp4":
-            candidates.add(prepared.with_suffix(".mp4"))
+        prepared = self._prepared_path(ydl, info, config.output_dir)
+        candidates = {prepared, prepared.with_suffix(f".{config.target_ext}")}
         return any(path.is_file() and path.stat().st_size > 0 for path in candidates)
 
     def _status(self, job: DownloadJob, status: str, error: str = "") -> None:

@@ -87,6 +87,18 @@ inline in the Details column.
 Remaining time is shown as `Ns` under a minute, `M:SS` under an hour, and
 `H:MM:SS` otherwise.
 
+## Audio downloads (MP3 and friends)
+
+The **Format** selector next to **Start download** switches the whole batch
+between video and audio-only. Audio choices are MP3, M4A, Opus, FLAC and WAV:
+yt-dlp grabs the best audio stream and FFmpeg converts it, so FFmpeg is
+required for these (the app says so inline if it cannot find it).
+
+The bitrate used for the lossy codecs is set in Settings; FLAC and WAV are
+lossless, so that control is disabled for them. Skip-existing understands the
+chosen extension, so re-running an MP3 batch skips tracks already converted
+rather than downloading them again.
+
 ## Quality and downloads
 
 Quality is a maximum height, not an exact target. For example, 1080p selects
