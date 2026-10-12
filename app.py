@@ -13,7 +13,7 @@ from queue import Empty, Queue
 from typing import Any
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest, QSslSocket
 from PySide6.QtWidgets import (
@@ -246,6 +246,17 @@ def job_detail(job: DownloadJob) -> str:
     if job.status == "Failed":
         return job.error or "Failed"
     return "Waiting…"
+
+
+def default_output_dir() -> str:
+    """A folder under Videos; the app's own directory is a poor default once
+    the app is installed under Program Files or LocalAppData."""
+    for location in (QStandardPaths.StandardLocation.MoviesLocation,
+                     QStandardPaths.StandardLocation.DownloadLocation):
+        base = QStandardPaths.writableLocation(location)
+        if base:
+            return str(Path(base) / "Video Batch Downloader")
+    return str(APP_DIR / "downloads")
 
 
 def app_icon() -> QIcon:
@@ -761,7 +772,7 @@ class MainWindow(QMainWindow):
         paths = QGroupBox("Paths")
         pg = QGridLayout(paths)
         pg.setHorizontalSpacing(8)
-        self.output_edit = QLineEdit(self.settings.get("output_folder", str(APP_DIR / "downloads")))
+        self.output_edit = QLineEdit(self.settings.get("output_folder", default_output_dir()))
         self.ffmpeg_edit = QLineEdit(self.settings.get("ffmpeg_path", ""))
         self.ffmpeg_edit.editingFinished.connect(self._check_tools)
         self.ffmpeg_edit.setPlaceholderText("Leave blank to use ffmpeg from PATH")

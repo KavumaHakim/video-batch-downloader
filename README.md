@@ -124,7 +124,8 @@ the best compatible stream at or below 1080p where possible; lower-resolution
 sources are not upscaled. Sequential mode uses one worker. Parallel mode uses
 1–5 workers and defaults to 3.
 
-The default output directory is `downloads`. yt-dlp resumes partial downloads,
+The default output directory is `Video Batch Downloader` under your Videos
+folder. yt-dlp resumes partial downloads,
 uses retries for temporary failures, and merges to MP4 when FFmpeg is
 available. Existing final files can be skipped; `.part` files alone are not
 treated as completed files.
@@ -132,18 +133,30 @@ treated as completed files.
 ## Building a standalone executable
 
 ```powershell
-.uild.ps1
+.\build.ps1            # dist\VideoBatchDownloader.exe
+.\build.ps1 -Installer # also dist\VideoBatchDownloader-<version>-setup.exe
 ```
 
-This runs PyInstaller with `VideoBatchDownloader.spec` and produces
-`dist\VideoBatchDownloader.exe`, a single windowed executable (about 55 MB)
-that needs no Python install. Settings, history, the log, and the default
-`downloads` folder are created next to the exe. FFmpeg is not bundled: keep it
-on `PATH` or point the FFmpeg path setting at it.
+The first form runs PyInstaller with `VideoBatchDownloader.spec` and produces
+a single windowed executable (about 53 MB) that needs no Python install. It is
+portable: settings, history and the log are written beside it, so it can live
+on a USB stick.
+
+`-Installer` additionally compiles `installer.iss` with Inno Setup (install it
+from https://jrsoftware.org/isdl.php if `ISCC.exe` is not found). The installer
+is **per-user**: it needs no administrator rights, installs to
+`%LOCALAPPDATA%\Programs\Video Batch Downloader`, and adds Start Menu entries
+plus an optional desktop icon. A per-user location matters here because the app
+writes its settings, history, log and any auto-downloaded FFmpeg next to the
+executable, which a Program Files install would forbid. Uninstalling removes
+those files; downloaded videos are left alone.
+
+FFmpeg is not bundled in either case — use the Download button in Settings, or
+keep FFmpeg on `PATH`.
 
 The spec pins the OpenSSL DLLs from the build interpreter and excludes Qt's
 OpenSSL plugin; without that, a same-named `libssl-3-x64.dll` earlier on
-`PATH` (Git's `mingw64in`, for example) can get bundled and break `ssl`.
+`PATH` (Git's `mingw64\bin`, for example) can get bundled and break `ssl`.
 
 ## Troubleshooting
 
