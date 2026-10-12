@@ -22,3 +22,6 @@ app_customtkinter_backup.py
 # PyInstaller output
 build/
 dist/
+
+# Auto-downloaded FFmpeg
+ffmpeg/

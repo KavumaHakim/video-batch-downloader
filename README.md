@@ -44,12 +44,16 @@ it does not exit just because FFmpeg is unavailable.
 
 ## URL sources
 
-URLs come from two places and are merged: a links file (chosen via **Browse**
-or by dragging a `.txt` file onto the window) and the **Direct links** box.
-Dragging text or URLs from a browser onto the window appends them to the
-direct links box. Both accept URLs separated by newlines, commas, spaces, or
-any mixture. Duplicates across the two sources are removed while preserving
-order. Malformed entries remain visible as `Invalid` and are skipped.
+Pasting links into the **Links** box on the Downloads tab is the main route:
+it accepts URLs separated by newlines, commas, spaces, or any mixture, and
+re-reads as you type. Dragging text or URLs from a browser onto the window
+appends them there.
+
+**Load from a file** below that box expands a secondary row for picking a
+`.txt` file of links (dropping a `.txt` file onto the window fills it in and
+expands the row automatically). When both are in use the two sources are
+merged and de-duplicated with order preserved. Malformed entries remain
+visible as `Invalid` and are skipped.
 
 ## Searching for videos
 
@@ -86,6 +90,20 @@ inline in the Details column.
 
 Remaining time is shown as `Ns` under a minute, `M:SS` under an hour, and
 `H:MM:SS` otherwise.
+
+## FFmpeg
+
+FFmpeg is needed to merge separate video/audio streams and for every audio
+format. Settings shows where it resolved to, and **Download** there fetches a
+static build into an `ffmpeg` folder beside the app — no install or admin
+rights required. Starting an audio batch without FFmpeg offers the same
+download.
+
+The archive comes from gyan.dev (the Windows build provider linked from
+ffmpeg.org) over HTTPS and is checked against the SHA-256 published alongside
+it; a mismatch is discarded rather than used. The transfer resumes if the
+connection drops and can be cancelled. A copy already on `PATH`, or one set
+explicitly in Settings, always takes precedence.
 
 ## Audio downloads (MP3 and friends)
 

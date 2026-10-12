@@ -176,7 +176,13 @@ class DownloadManager:
         else:
             options["format"] = self._format_for(config.quality)
             options["merge_output_format"] = "mp4"
-        if config.ffmpeg_path:
+        # Point yt-dlp at whatever we resolved rather than letting it search PATH
+        # on its own: an auto-downloaded FFmpeg lives beside the app, not on PATH.
+        # The directory is passed so ffprobe is picked up alongside ffmpeg.
+        resolved = find_ffmpeg(config.ffmpeg_path)
+        if resolved:
+            options["ffmpeg_location"] = str(Path(resolved).parent)
+        elif config.ffmpeg_path:
             options["ffmpeg_location"] = config.ffmpeg_path
         return options
 
@@ -258,6 +264,13 @@ def find_ffmpeg(configured_path: str = "") -> Optional[str]:
                 path = candidate / name
                 if path.is_file():
                     return str(path)
+    try:
+        from ffmpeg_setup import installed_ffmpeg
+        downloaded = installed_ffmpeg()
+    except Exception:
+        downloaded = None
+    if downloaded:
+        return str(downloaded)
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         candidate = Path(folder) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
         if candidate.is_file():

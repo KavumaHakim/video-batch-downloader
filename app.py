@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sys
+import threading
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
@@ -18,13 +19,15 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequ
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QProgressDialog, QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from downloader import (
     AUDIO_FORMATS, LOSSLESS_AUDIO, YT_DLP_IMPORT_ERROR, DownloadConfig, DownloadJob, DownloadManager,
     find_ffmpeg, yt_dlp,
 )
+import ffmpeg_setup
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
 
 
@@ -267,6 +270,31 @@ class SearchWorker(QThread):
             self.failed.emit(self.generation, str(exc).strip() or exc.__class__.__name__)
 
 
+class FFmpegFetcher(QThread):
+    """Downloads FFmpeg off the GUI thread."""
+
+    progressed = Signal(int, int)
+    succeeded = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, parent: Any = None) -> None:
+        super().__init__(parent)
+        self.cancel = threading.Event()
+
+    def run(self) -> None:
+        try:
+            path = ffmpeg_setup.download_ffmpeg(
+                progress=lambda done, total: self.progressed.emit(done, total),
+                cancel=self.cancel,
+            )
+        except ffmpeg_setup.DownloadCancelled:
+            self.failed.emit("")
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+        else:
+            self.succeeded.emit(str(path))
+
+
 class MainWindow(QMainWindow):
     JOB_COLS = ("#", "Video", "Progress", "Details", "Status", "")
     HIST_COLS = ("Time", "Title", "Status", "URL", "Output / Error")
@@ -291,6 +319,8 @@ class MainWindow(QMainWindow):
         self._exiting = False
         self._tray_hint_shown = False
         self.tray: QSystemTrayIcon | None = None
+        self._ffmpeg_fetcher: FFmpegFetcher | None = None
+        self._ffmpeg_dialog: QProgressDialog | None = None
         self.search_results: list[SearchResult] = []
         self._search_worker: SearchWorker | None = None
         self._search_generation = 0
@@ -383,33 +413,47 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        source = QGroupBox("Links file")
-        grid = QGridLayout(source)
+        source = QGroupBox("Links  (one per line, or separated by commas or spaces)")
+        sl = QVBoxLayout(source)
+        sl.setSpacing(8)
+        self.direct_edit = QPlainTextEdit()
+        self.direct_edit.setPlaceholderText("Paste video links here — https://…  https://…")
+        self.direct_edit.setMinimumHeight(110)
+        self.direct_edit.textChanged.connect(lambda: self._reload_timer.start())
+        sl.addWidget(self.direct_edit)
+
+        meta = QHBoxLayout()
+        self.count_label = QLabel("Videos found: 0")
+        self.count_label.setObjectName("muted")
+        meta.addWidget(self.count_label, 1)
+        self.file_toggle = QToolButton()
+        self.file_toggle.setText("Load from a file")
+        self.file_toggle.setCheckable(True)
+        self.file_toggle.setAutoRaise(True)
+        self.file_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.file_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.file_toggle.toggled.connect(self._toggle_file_source)
+        meta.addWidget(self.file_toggle)
+        sl.addLayout(meta)
+
+        self.file_row = QWidget()
+        grid = QGridLayout(self.file_row)
+        grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(8)
         self.links_edit = QLineEdit()
-        self.links_edit.setPlaceholderText("Choose a .txt file, or drop one onto the window")
+        self.links_edit.setPlaceholderText("Choose a .txt file of links, or drop one onto the window")
         self.links_edit.editingFinished.connect(self._reload_links)
         browse = QPushButton("Browse")
         browse.clicked.connect(self._browse_links)
-        reload = QPushButton("Reload")
-        reload.clicked.connect(self._reload_links)
-        self.count_label = QLabel("Videos found: 0")
-        self.count_label.setObjectName("muted")
+        self.links_clear_btn = QPushButton("Clear")
+        self.links_clear_btn.clicked.connect(self._clear_links_file)
         grid.addWidget(self.links_edit, 0, 0)
         grid.addWidget(browse, 0, 1)
-        grid.addWidget(reload, 0, 2)
-        grid.addWidget(self.count_label, 1, 0, 1, 3)
+        grid.addWidget(self.links_clear_btn, 0, 2)
         grid.setColumnStretch(0, 1)
+        self.file_row.setVisible(False)
+        sl.addWidget(self.file_row)
         layout.addWidget(source)
-
-        direct = QGroupBox("Direct links  (commas, spaces, or newlines)")
-        dl = QVBoxLayout(direct)
-        self.direct_edit = QPlainTextEdit()
-        self.direct_edit.setPlaceholderText("https://…  https://…")
-        self.direct_edit.setMaximumHeight(90)
-        self.direct_edit.textChanged.connect(lambda: self._reload_timer.start())
-        dl.addWidget(self.direct_edit)
-        layout.addWidget(direct)
 
         self.jobs_table = QTableWidget(0, len(self.JOB_COLS))
         self.jobs_table.setHorizontalHeaderLabels(self.JOB_COLS)
@@ -719,6 +763,7 @@ class MainWindow(QMainWindow):
         pg.setHorizontalSpacing(8)
         self.output_edit = QLineEdit(self.settings.get("output_folder", str(APP_DIR / "downloads")))
         self.ffmpeg_edit = QLineEdit(self.settings.get("ffmpeg_path", ""))
+        self.ffmpeg_edit.editingFinished.connect(self._check_tools)
         self.ffmpeg_edit.setPlaceholderText("Leave blank to use ffmpeg from PATH")
         self.ffmpeg_edit.editingFinished.connect(self._check_tools)
         out_btn = QPushButton("Browse")
@@ -731,6 +776,15 @@ class MainWindow(QMainWindow):
         pg.addWidget(QLabel("FFmpeg path"), 1, 0)
         pg.addWidget(self.ffmpeg_edit, 1, 1)
         pg.addWidget(ff_btn, 1, 2)
+        self.ffmpeg_get_btn = QPushButton("Download")
+        self.ffmpeg_get_btn.setToolTip("Fetch a static FFmpeg build from gyan.dev into the app folder")
+        self.ffmpeg_get_btn.clicked.connect(self._fetch_ffmpeg)
+        self.ffmpeg_get_btn.setVisible(ffmpeg_setup.is_supported())
+        pg.addWidget(self.ffmpeg_get_btn, 1, 3)
+        self.ffmpeg_status = QLabel()
+        self.ffmpeg_status.setObjectName("muted")
+        self.ffmpeg_status.setWordWrap(True)
+        pg.addWidget(self.ffmpeg_status, 2, 1, 1, 3)
         pg.setColumnStretch(1, 1)
         layout.addWidget(paths)
 
@@ -796,10 +850,23 @@ class MainWindow(QMainWindow):
         self.tray.activated.connect(self._tray_activated)
 
     # ---------------------------------------------------------------- links
+    def _toggle_file_source(self, checked: bool) -> None:
+        self.file_row.setVisible(checked)
+        self.file_toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+
+    def _show_file_source(self) -> None:
+        if not self.file_toggle.isChecked():
+            self.file_toggle.setChecked(True)
+
+    def _clear_links_file(self) -> None:
+        self.links_edit.clear()
+        self._reload_links()
+
     def _browse_links(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Choose links file", "", "Text files (*.txt);;All files (*.*)")
         if path:
             self.links_edit.setText(path)
+            self._show_file_source()
             self._reload_links()
 
     def _collect_urls(self) -> list[str]:
@@ -945,11 +1012,29 @@ class MainWindow(QMainWindow):
                 self.format_hint.setText(f".{ext} needs FFmpeg — not found")
                 self.format_hint.setStyleSheet(f"color: {STATUS_COLORS['Cancelled']}")
 
+    def _require_ffmpeg_for_audio(self) -> bool:
+        """True when the batch may proceed; offers the download when it may not."""
+        if not self._audio_format() or find_ffmpeg(self.ffmpeg_edit.text().strip()):
+            return True
+        if not ffmpeg_setup.is_supported():
+            QMessageBox.critical(self, "FFmpeg required",
+                                 "Audio downloads need FFmpeg. Install it and set its path in Settings.")
+            return False
+        if QMessageBox.question(
+            self, "FFmpeg required",
+            f"Saving as {self._audio_format().upper()} needs FFmpeg, which was not found.\n\n"
+            "Download it now?",
+        ) == QMessageBox.StandardButton.Yes:
+            self._fetch_ffmpeg()
+        return False
+
     def _start(self) -> None:
         self._reload_links()
         pending = [j for j in self.jobs if j.status in {"Queued", *RETRYABLE} and is_basic_url(j.url)]
         if not pending:
             QMessageBox.information(self, "Nothing to download", "Add at least one valid URL via the links file or the direct links box.")
+            return
+        if not self._require_ffmpeg_for_audio():
             return
         self._launch(pending)
 
@@ -1033,26 +1118,105 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- tools
     def _check_tools(self) -> None:
-        ffmpeg = find_ffmpeg(self.ffmpeg_edit.text().strip())
         if yt_dlp is None:
             self.tool_label.setText(f"yt-dlp failed to load — {YT_DLP_IMPORT_ERROR}" if YT_DLP_IMPORT_ERROR else "yt-dlp is missing — run: uv sync")
             self.tool_label.setToolTip(YT_DLP_IMPORT_ERROR)
             self.logger.error("yt-dlp import failed: %s", YT_DLP_IMPORT_ERROR)
             self.tool_label.setStyleSheet(f"color: {STATUS_COLORS['Failed']}")
-        elif not ffmpeg:
-            self.tool_label.setText("FFmpeg was not found. Separate video/audio streams may not merge correctly.")
-            self.tool_label.setStyleSheet(f"color: {STATUS_COLORS['Cancelled']}")
         else:
-            short = Path(ffmpeg)
-            shown = str(Path(*short.parts[-3:])) if len(short.parts) > 3 else str(short)
-            self.tool_label.setText("yt-dlp ready   •   FFmpeg: …\\" + shown)
-            self.tool_label.setToolTip(ffmpeg)
+            self.tool_label.setText("yt-dlp ready")
+            self.tool_label.setToolTip("")
             self.tool_label.setStyleSheet(f"color: {STATUS_COLORS['Completed']}")
+        self._update_ffmpeg_status()
+
+    def _update_ffmpeg_status(self) -> None:
+        """Report where FFmpeg resolved to, in Settings rather than the header."""
+        if not hasattr(self, "ffmpeg_status"):
+            return
+        ffmpeg = find_ffmpeg(self.ffmpeg_edit.text().strip())
+        if ffmpeg:
+            self.ffmpeg_status.setText(f"Using {ffmpeg}")
+            self.ffmpeg_status.setToolTip(ffmpeg)
+            self.ffmpeg_status.setStyleSheet(f"color: {STATUS_COLORS['Completed']}")
+        else:
+            self.ffmpeg_status.setText(
+                "Not found — audio conversion is unavailable and separate video/audio streams may not merge."
+            )
+            self.ffmpeg_status.setToolTip("")
+            self.ffmpeg_status.setStyleSheet(f"color: {STATUS_COLORS['Cancelled']}")
+        if hasattr(self, "ffmpeg_get_btn"):
+            self.ffmpeg_get_btn.setText("Download" if not ffmpeg else "Re-download")
 
     def _browse_output(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose output folder", self.output_edit.text())
         if path:
             self.output_edit.setText(path)
+
+    def _fetch_ffmpeg(self, _checked: bool = False) -> None:
+        if self._ffmpeg_fetcher is not None:
+            return
+        existing = find_ffmpeg(self.ffmpeg_edit.text().strip())
+        if existing and QMessageBox.question(
+            self, "FFmpeg already available",
+            f"FFmpeg was found at:\n{existing}\n\nDownload another copy anyway?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        version = ffmpeg_setup.latest_version()
+        label = f"FFmpeg {version}" if version else "FFmpeg"
+        if QMessageBox.question(
+            self, "Download FFmpeg",
+            f"Download {label} (about 115 MB) from gyan.dev into:\n{ffmpeg_setup.install_dir()}\n\n"
+            "The archive is checked against the SHA-256 published alongside it. Continue?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        dialog = QProgressDialog("Downloading FFmpeg…", "Cancel", 0, 100, self)
+        dialog.setWindowTitle("Download FFmpeg")
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+        dialog.setValue(0)
+        fetcher = FFmpegFetcher(self)
+        dialog.canceled.connect(fetcher.cancel.set)
+        fetcher.progressed.connect(self._ffmpeg_progress)
+        fetcher.succeeded.connect(self._ffmpeg_done)
+        fetcher.failed.connect(self._ffmpeg_failed)
+        self._ffmpeg_dialog, self._ffmpeg_fetcher = dialog, fetcher
+        self.ffmpeg_get_btn.setEnabled(False)
+        fetcher.start()
+        dialog.show()
+
+    def _ffmpeg_progress(self, done: int, total: int) -> None:
+        if not self._ffmpeg_dialog:
+            return
+        if total:
+            self._ffmpeg_dialog.setValue(int(done / total * 100))
+            self._ffmpeg_dialog.setLabelText(f"Downloading FFmpeg…  {format_bytes(done)} / {format_bytes(total)}")
+        else:
+            self._ffmpeg_dialog.setLabelText(f"Downloading FFmpeg…  {format_bytes(done)}")
+
+    def _finish_ffmpeg_fetch(self) -> None:
+        if self._ffmpeg_dialog:
+            self._ffmpeg_dialog.close()
+        self._ffmpeg_dialog = None
+        self._ffmpeg_fetcher = None
+        self.ffmpeg_get_btn.setEnabled(True)
+        self._check_tools()
+        self._format_changed()
+
+    def _ffmpeg_done(self, path: str) -> None:
+        self._finish_ffmpeg_fetch()
+        self.logger.info("FFmpeg installed at %s", path)
+        self.status_label.setText(f"FFmpeg ready at {path}")
+        QMessageBox.information(self, "FFmpeg ready", f"FFmpeg was installed at:\n{path}")
+
+    def _ffmpeg_failed(self, message: str) -> None:
+        self._finish_ffmpeg_fetch()
+        if not message:
+            self.status_label.setText("FFmpeg download cancelled")
+            return
+        self.logger.error("FFmpeg download failed: %s", message)
+        QMessageBox.critical(self, "FFmpeg download failed", message)
 
     def _browse_ffmpeg(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Locate ffmpeg", "", "FFmpeg (ffmpeg.exe ffmpeg);;All files (*.*)")
@@ -1187,6 +1351,7 @@ class MainWindow(QMainWindow):
             remote = [u.toString() for u in mime.urls() if not u.isLocalFile()]
             if local:
                 self.links_edit.setText(local[0])
+                self._show_file_source()
             if remote:
                 self._append_direct(" ".join(remote))
         elif mime.hasText():
