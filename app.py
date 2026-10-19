@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (
 )
 
 from downloader import (
-    AUDIO_FORMATS, LOSSLESS_AUDIO, YT_DLP_IMPORT_ERROR, DownloadConfig, DownloadJob, DownloadManager,
-    find_ffmpeg, yt_dlp,
+    AUDIO_FORMATS, DEFAULT_SUBTITLE_LANGS, EMBED_SUBTITLE_MODES, LOSSLESS_AUDIO, YT_DLP_IMPORT_ERROR,
+    DownloadConfig, DownloadJob, DownloadManager, find_ffmpeg, subtitle_languages, yt_dlp,
 )
 import ffmpeg_setup
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
@@ -66,6 +66,14 @@ FORMAT_CHOICES: list[tuple[str, str]] = [
     ("Audio: WAV", "wav"),
 ]
 AUDIO_BITRATES = ["320", "256", "192", "128", "96"]
+
+# Combo label -> DownloadConfig.subtitle_mode ("" leaves subtitles alone).
+SUBTITLE_CHOICES: list[tuple[str, str]] = [
+    ("No subtitles", ""),
+    ("Save as .srt file", "file"),
+    ("Embed in the video", "embed"),
+    ("Embed and keep the file", "both"),
+]
 
 
 def MONO_FONT() -> QFont:
@@ -830,9 +838,37 @@ class MainWindow(QMainWindow):
         form.setColumnStretch(3, 1)
         layout.addWidget(opts)
 
+        subs = QGroupBox("Subtitles")
+        sg = QGridLayout(subs)
+        sg.setHorizontalSpacing(12)
+        self.subs_box = QComboBox()
+        for label, _mode in SUBTITLE_CHOICES:
+            self.subs_box.addItem(label)
+        self.subs_box.setCurrentText(self.settings.get("subtitles", SUBTITLE_CHOICES[0][0]))
+        self.subs_box.setMinimumWidth(170)
+        self.subs_box.currentTextChanged.connect(self._subtitles_changed)
+        self.subs_lang_edit = QLineEdit(self.settings.get("subtitle_langs", DEFAULT_SUBTITLE_LANGS))
+        self.subs_lang_edit.setPlaceholderText("en, es  —  or all for every language offered")
+        self.subs_lang_edit.textChanged.connect(self._subtitles_changed)
+        self.subs_auto_check = QCheckBox("Accept auto-generated captions when there is no human-made track")
+        self.subs_auto_check.setChecked(bool(self.settings.get("subtitle_auto", True)))
+        self.subs_hint = QLabel()
+        self.subs_hint.setObjectName("muted")
+        self.subs_hint.setWordWrap(True)
+        sg.addWidget(QLabel("Subtitles"), 0, 0)
+        sg.addWidget(self.subs_box, 0, 1)
+        self.subs_lang_label = QLabel("Languages")
+        sg.addWidget(self.subs_lang_label, 0, 2)
+        sg.addWidget(self.subs_lang_edit, 0, 3)
+        sg.addWidget(self.subs_auto_check, 1, 0, 1, 4)
+        sg.addWidget(self.subs_hint, 2, 0, 1, 4)
+        sg.setColumnStretch(3, 1)
+        layout.addWidget(subs)
+
         note = QLabel("Video quality is a maximum height; lower-resolution sources are never upscaled. "
                       "Audio formats download the best available audio stream and convert it with FFmpeg "
                       "(FLAC and WAV are lossless, so bitrate does not apply). "
+                      "Subtitles are skipped silently when a video offers none in the languages asked for. "
                       "Settings are saved when a download starts and on exit.")
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -994,6 +1030,10 @@ class MainWindow(QMainWindow):
         label = self.format_box.currentText()
         return next((codec for name, codec in FORMAT_CHOICES if name == label), "")
 
+    def _subtitle_mode(self) -> str:
+        label = self.subs_box.currentText()
+        return next((mode for name, mode in SUBTITLE_CHOICES if name == label), "")
+
     def _config(self) -> DownloadConfig:
         return DownloadConfig(
             Path(self.output_edit.text()).expanduser(),
@@ -1004,6 +1044,9 @@ class MainWindow(QMainWindow):
             self.ffmpeg_edit.text().strip(),
             self._audio_format(),
             self.bitrate_box.currentText().split()[0],
+            self._subtitle_mode(),
+            self.subs_lang_edit.text().strip() or DEFAULT_SUBTITLE_LANGS,
+            self.subs_auto_check.isChecked(),
         )
 
     def _format_changed(self, _: str = "") -> None:
@@ -1022,19 +1065,55 @@ class MainWindow(QMainWindow):
             else:
                 self.format_hint.setText(f".{ext} needs FFmpeg — not found")
                 self.format_hint.setStyleSheet(f"color: {STATUS_COLORS['Cancelled']}")
+        self._subtitles_changed()
 
-    def _require_ffmpeg_for_audio(self) -> bool:
+    def _subtitles_changed(self, _: str = "") -> None:
+        mode = self._subtitle_mode()
+        audio = bool(self._audio_format())
+        active = bool(mode) and not audio
+        self.subs_box.setEnabled(not audio)
+        for widget in (self.subs_lang_label, self.subs_lang_edit, self.subs_auto_check):
+            widget.setEnabled(active)
+        if audio:
+            self.subs_hint.setText("Subtitles do not apply to audio-only downloads.")
+            self.subs_hint.setStyleSheet(f"color: {MUTED}")
+            return
+        if not mode:
+            self.subs_hint.setText("")
+            return
+        has_ffmpeg = bool(find_ffmpeg(self.ffmpeg_edit.text().strip()))
+        if mode in EMBED_SUBTITLE_MODES and not has_ffmpeg:
+            self.subs_hint.setText("Embedding subtitles needs FFmpeg — not found.")
+            self.subs_hint.setStyleSheet(f"color: {STATUS_COLORS['Cancelled']}")
+            return
+        langs = subtitle_languages(self.subs_lang_edit.text().strip() or DEFAULT_SUBTITLE_LANGS)
+        wanted = "every language offered" if "all" in langs else ", ".join(langs)
+        if mode == "embed":
+            text = f"Captions ({wanted}) become a subtitle track inside the MP4."
+        elif mode == "file":
+            text = f"Captions ({wanted}) are saved next to the video"
+            text += " as .srt." if has_ffmpeg else " in whatever format the site offers (.srt needs FFmpeg)."
+        else:
+            text = f"Captions ({wanted}) are embedded in the MP4 and kept as .srt files."
+        self.subs_hint.setText(text)
+        self.subs_hint.setStyleSheet(f"color: {MUTED}")
+
+    def _require_ffmpeg(self) -> bool:
         """True when the batch may proceed; offers the download when it may not."""
-        if not self._audio_format() or find_ffmpeg(self.ffmpeg_edit.text().strip()):
+        codec = self._audio_format()
+        embedding = not codec and self._subtitle_mode() in EMBED_SUBTITLE_MODES
+        if not codec and not embedding:
             return True
+        if find_ffmpeg(self.ffmpeg_edit.text().strip()):
+            return True
+        need = f"Saving as {codec.upper()}" if codec else "Embedding subtitles"
         if not ffmpeg_setup.is_supported():
             QMessageBox.critical(self, "FFmpeg required",
-                                 "Audio downloads need FFmpeg. Install it and set its path in Settings.")
+                                 f"{need} needs FFmpeg. Install it and set its path in Settings.")
             return False
         if QMessageBox.question(
             self, "FFmpeg required",
-            f"Saving as {self._audio_format().upper()} needs FFmpeg, which was not found.\n\n"
-            "Download it now?",
+            f"{need} needs FFmpeg, which was not found.\n\nDownload it now?",
         ) == QMessageBox.StandardButton.Yes:
             self._fetch_ffmpeg()
         return False
@@ -1045,7 +1124,7 @@ class MainWindow(QMainWindow):
         if not pending:
             QMessageBox.information(self, "Nothing to download", "Add at least one valid URL via the links file or the direct links box.")
             return
-        if not self._require_ffmpeg_for_audio():
+        if not self._require_ffmpeg():
             return
         self._launch(pending)
 
@@ -1252,6 +1331,9 @@ class MainWindow(QMainWindow):
             "quality": self.quality_box.currentText(),
             "format": self.format_box.currentText(),
             "audio_quality": self.bitrate_box.currentText().split()[0],
+            "subtitles": self.subs_box.currentText(),
+            "subtitle_langs": self.subs_lang_edit.text().strip() or DEFAULT_SUBTITLE_LANGS,
+            "subtitle_auto": self.subs_auto_check.isChecked(),
             "mode": self.mode_box.currentText(),
             "workers": self.workers_spin.value(),
             "skip_existing": self.skip_check.isChecked(),

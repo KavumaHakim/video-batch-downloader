@@ -117,6 +117,21 @@ lossless, so that control is disabled for them. Skip-existing understands the
 chosen extension, so re-running an MP3 batch skips tracks already converted
 rather than downloading them again.
 
+## Subtitles
+
+Settings has a **Subtitles** group that applies to the whole batch. The choices
+are no subtitles, save as an `.srt` file next to the video, embed a subtitle
+track in the MP4, or both. **Languages** takes codes separated by commas or
+spaces (`en, es`), or `all` for every language a video offers, and
+auto-generated captions can be accepted when a video has no human-made track.
+
+Embedding runs through FFmpeg, so it needs the same FFmpeg as audio downloads
+and offers the built-in download if none is found; sidecar files are converted
+to `.srt` when FFmpeg is available and otherwise kept in whatever format the
+site serves. A video that offers no captions in the languages asked for still
+downloads — the subtitle step is simply skipped. Audio-only formats ignore
+subtitles, and the group says so.
+
 ## Quality and downloads
 
 Quality is a maximum height, not an exact target. For example, 1080p selects

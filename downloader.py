@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -38,6 +39,17 @@ class DownloadJob:
 AUDIO_FORMATS = {"mp3": "mp3", "m4a": "m4a", "opus": "opus", "wav": "wav", "flac": "flac"}
 LOSSLESS_AUDIO = {"wav", "flac"}
 
+# DownloadConfig.subtitle_mode values ("" leaves subtitles alone).
+EMBED_SUBTITLE_MODES = {"embed", "both"}
+KEEP_SUBTITLE_MODES = {"file", "both"}
+DEFAULT_SUBTITLE_LANGS = "en"
+
+
+def subtitle_languages(raw: str) -> list[str]:
+    """Split a user-typed language list ("en, es" or "all") into yt-dlp codes."""
+    langs = [part for part in re.split(r"[,;\s]+", raw.strip()) if part]
+    return langs or [DEFAULT_SUBTITLE_LANGS]
+
 
 @dataclass
 class DownloadConfig:
@@ -49,10 +61,23 @@ class DownloadConfig:
     ffmpeg_path: str = ""
     audio_format: str = ""       # "" = video; otherwise an AUDIO_FORMATS key
     audio_quality: str = "192"   # kbps, ignored for lossless codecs
+    subtitle_mode: str = ""      # "" = none; "file", "embed" or "both"
+    subtitle_langs: str = DEFAULT_SUBTITLE_LANGS
+    subtitle_auto: bool = True   # also accept machine-generated captions
 
     @property
     def audio_only(self) -> bool:
         return bool(self.audio_format)
+
+    @property
+    def wants_subtitles(self) -> bool:
+        # Subtitles only make sense for the video pipeline; an audio file has
+        # nowhere to put them and the sidecar files would be orphans.
+        return bool(self.subtitle_mode) and not self.audio_only
+
+    @property
+    def embeds_subtitles(self) -> bool:
+        return self.wants_subtitles and self.subtitle_mode in EMBED_SUBTITLE_MODES
 
     @property
     def target_ext(self) -> str:
@@ -85,6 +110,11 @@ class DownloadManager:
             raise RuntimeError(
                 f"Converting to {config.audio_format.upper()} needs FFmpeg, which was not found. "
                 "Install FFmpeg and put it on PATH, or set the FFmpeg path in Settings."
+            )
+        if config.embeds_subtitles and not find_ffmpeg(config.ffmpeg_path):
+            raise RuntimeError(
+                "Embedding subtitles needs FFmpeg, which was not found. Install FFmpeg and put it "
+                "on PATH, set the FFmpeg path in Settings, or save subtitles as separate files."
             )
 
         config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -164,18 +194,6 @@ class DownloadManager:
             "no_warnings": True,
             "logger": self.logger,
         }
-        if config.audio_only:
-            options["format"] = "ba/b"
-            postprocessor: dict[str, Any] = {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": config.audio_format,
-            }
-            if config.audio_format not in LOSSLESS_AUDIO:
-                postprocessor["preferredquality"] = config.audio_quality
-            options["postprocessors"] = [postprocessor]
-        else:
-            options["format"] = self._format_for(config.quality)
-            options["merge_output_format"] = "mp4"
         # Point yt-dlp at whatever we resolved rather than letting it search PATH
         # on its own: an auto-downloaded FFmpeg lives beside the app, not on PATH.
         # The directory is passed so ffprobe is picked up alongside ffmpeg.
@@ -184,7 +202,44 @@ class DownloadManager:
             options["ffmpeg_location"] = str(Path(resolved).parent)
         elif config.ffmpeg_path:
             options["ffmpeg_location"] = config.ffmpeg_path
+
+        postprocessors: list[dict[str, Any]] = []
+        if config.audio_only:
+            options["format"] = "ba/b"
+            extract: dict[str, Any] = {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": config.audio_format,
+            }
+            if config.audio_format not in LOSSLESS_AUDIO:
+                extract["preferredquality"] = config.audio_quality
+            postprocessors.append(extract)
+        else:
+            options["format"] = self._format_for(config.quality)
+            options["merge_output_format"] = "mp4"
+        if config.wants_subtitles:
+            postprocessors.extend(self._subtitle_options(options, config, bool(resolved)))
+        if postprocessors:
+            options["postprocessors"] = postprocessors
         return options
+
+    @staticmethod
+    def _subtitle_options(
+        options: dict[str, Any], config: DownloadConfig, has_ffmpeg: bool
+    ) -> list[dict[str, Any]]:
+        """Turn on subtitle downloads and return the postprocessors they need."""
+        options["writesubtitles"] = True
+        options["writeautomaticsub"] = config.subtitle_auto
+        options["subtitleslangs"] = subtitle_languages(config.subtitle_langs)
+        options["subtitlesformat"] = "srt/vtt/best"
+
+        postprocessors: list[dict[str, Any]] = []
+        keep_files = config.subtitle_mode in KEEP_SUBTITLE_MODES
+        if keep_files and has_ffmpeg:
+            # Sources often only offer VTT; .srt is what players expect.
+            postprocessors.append({"key": "FFmpegSubtitlesConvertor", "format": "srt"})
+        if config.subtitle_mode in EMBED_SUBTITLE_MODES:
+            postprocessors.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": keep_files})
+        return postprocessors
 
     def _postprocessor_hook(self, job: DownloadJob) -> Callable[[dict[str, Any]], None]:
         def hook(data: dict[str, Any]) -> None:
