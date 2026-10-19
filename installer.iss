@@ -3,7 +3,7 @@
 ; Requires dist\VideoBatchDownloader.exe to exist first.
 
 #define AppName "Video Batch Downloader"
-#define AppVersion "0.1.0"
+#define AppVersion "0.2.0"
 #define AppPublisher "KavumaHakim"
 #define AppURL "https://github.com/KavumaHakim/video-batch-downloader"
 #define AppExe "VideoBatchDownloader.exe"

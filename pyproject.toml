@@ -1,6 +1,6 @@
 [project]
 name = "video-batch-downloader"
-version = "0.1.0"
+version = "0.2.0"
 description = "A CustomTkinter frontend for batch video downloading with yt-dlp."
 readme = "README.md"
 requires-python = ">=3.10"
