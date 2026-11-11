@@ -17,18 +17,20 @@ from PySide6.QtCore import QByteArray, QSize, QStandardPaths, Qt, QThread, QTime
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest, QSslSocket
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QProgressDialog, QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
-    QVBoxLayout, QWidget,
+    QProgressDialog, QScrollArea, QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from downloader import (
     AUDIO_FORMATS, DEFAULT_SUBTITLE_LANGS, EMBED_SUBTITLE_MODES, LOSSLESS_AUDIO, YT_DLP_IMPORT_ERROR,
-    DownloadConfig, DownloadJob, DownloadManager, find_ffmpeg, subtitle_languages, yt_dlp,
+    DownloadConfig, DownloadJob, DownloadManager, PlaylistEntry, clean_error, expand_playlist,
+    find_ffmpeg, is_search_query, looks_like_playlist, subtitle_languages, yt_dlp,
 )
 import ffmpeg_setup
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
+from spotify import DEFAULT_MATCH_SOURCE, MATCH_SOURCES, SpotifyError, looks_like_spotify, spotify_tracks
 
 
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -206,6 +208,11 @@ def is_basic_url(url: str) -> bool:
         return False
 
 
+def is_queueable(url: str) -> bool:
+    """A target yt-dlp can take: a real link, or a search the app queued itself."""
+    return is_basic_url(url) or is_search_query(url)
+
+
 def format_eta(seconds: Any) -> str:
     if seconds is None:
         return "—"
@@ -243,8 +250,12 @@ def job_detail(job: DownloadJob) -> str:
         speed = f"{format_bytes(job.speed)}/s" if job.speed else "—"
         return f"{percent:>4}  {amount} • {speed} • ETA {format_eta(job.eta)}"
     if job.status == "Completed":
-        size = format_bytes(job.total_bytes or job.downloaded_bytes)
-        return f"Done  •  {size}" if job.total_bytes or job.downloaded_bytes else "Done"
+        if job.media_count > 1:
+            done = f"Done  •  {job.media_count} files"
+        else:
+            size = format_bytes(job.total_bytes or job.downloaded_bytes)
+            done = f"Done  •  {size}" if job.total_bytes or job.downloaded_bytes else "Done"
+        return f"{done}  •  no subtitles" if job.note else done
     if job.status == "Skipped":
         return "Already downloaded"
     if job.status == "Cancelled":
@@ -287,6 +298,58 @@ class SearchWorker(QThread):
             self.finished_ok.emit(self.generation, search_videos(self.query, self.prefix, self.limit, self.logger))
         except Exception as exc:
             self.failed.emit(self.generation, str(exc).strip() or exc.__class__.__name__)
+
+
+class PlaylistWorker(QThread):
+    """Resolves playlist, channel and Spotify links into individual entries.
+
+    Runs off the GUI thread: a long playlist takes a few seconds to enumerate
+    and a channel can take considerably longer.
+    """
+
+    progressed = Signal(str)
+    # {source url: [PlaylistEntry]}, [(url, error)], cancelled
+    finished_ok = Signal(dict, list, bool)
+
+    def __init__(self, urls: list[str], limit: int, source: str, logger: logging.Logger) -> None:
+        super().__init__()
+        self.urls, self.limit, self.logger = urls, limit, logger
+        self.source = source           # yt-dlp search prefix for Spotify tracks
+        self.cancel = threading.Event()
+
+    def run(self) -> None:
+        found: dict[str, list[PlaylistEntry]] = {}
+        problems: list[tuple[str, str]] = []
+        for position, url in enumerate(self.urls, 1):
+            if self.cancel.is_set():
+                break
+            spotify = looks_like_spotify(url)
+            self.progressed.emit(
+                f"Reading {'Spotify link' if spotify else 'playlist'} {position} of {len(self.urls)}…")
+            try:
+                entries = self._spotify(url) if spotify else expand_playlist(
+                    url, self.logger, self.limit, self.cancel)
+            except Exception as exc:
+                # A link that cannot be read this way stays a single job rather
+                # than blocking the batch (YouTube mixes, for instance).
+                message = clean_error(exc) or exc.__class__.__name__
+                self.logger.warning("Not expanded: %s | %s", url, message)
+                problems.append((url, message))
+                continue
+            if entries:
+                found[url] = entries
+                self.logger.info("%s expanded to %d item(s)", url, len(entries))
+        self.finished_ok.emit(found, problems, self.cancel.is_set())
+
+    def _spotify(self, url: str) -> list[PlaylistEntry]:
+        """Spotify's own audio is DRM-locked, so queue a search for each track."""
+        name, tracks = spotify_tracks(url, self.logger, self.limit)
+        if not tracks:
+            raise SpotifyError("Spotify listed no tracks for that link.")
+        # One track on its own is not a collection, so it gets no folder.
+        collection = name if len(tracks) > 1 else ""
+        return [PlaylistEntry(track.search_url(self.source), track.label, collection, url, index)
+                for index, track in enumerate(tracks, 1)]
 
 
 class FFmpegFetcher(QThread):
@@ -343,6 +406,11 @@ class MainWindow(QMainWindow):
         self.search_results: list[SearchResult] = []
         self._search_worker: SearchWorker | None = None
         self._search_generation = 0
+        # Playlist URL -> the videos behind it, so a second Start does not have
+        # to re-read every playlist over the network.
+        self._expanded: dict[str, list[PlaylistEntry]] = {}
+        self._not_playlists: set[str] = set()
+        self._playlist_worker: PlaylistWorker | None = None
         self._net = QNetworkAccessManager(self)
         self._thumb_cache: dict[str, QPixmap] = {}
 
@@ -380,7 +448,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_downloads_tab(), "Downloads")
         self.tabs.addTab(self._build_search_tab(), "Search")
         self.tabs.addTab(self._build_history_tab(), "History")
-        self.tabs.addTab(self._build_settings_tab(), "Settings")
+        self.tabs.addTab(self._scrollable(self._build_settings_tab()), "Settings")
         layout.addWidget(self.tabs, 1)
 
         bottom = QHBoxLayout()
@@ -838,6 +906,59 @@ class MainWindow(QMainWindow):
         form.setColumnStretch(3, 1)
         layout.addWidget(opts)
 
+        lists = QGroupBox("Playlists and channels")
+        lg = QGridLayout(lists)
+        lg.setHorizontalSpacing(12)
+        self.playlist_check = QCheckBox("Download every video behind a playlist, channel or album link")
+        self.playlist_check.setChecked(bool(self.settings.get("playlists", True)))
+        self.playlist_check.toggled.connect(self._playlists_changed)
+        self.playlist_folder_check = QCheckBox("Save each playlist in its own subfolder")
+        self.playlist_folder_check.setChecked(bool(self.settings.get("playlist_folders", True)))
+        self.playlist_folder_check.toggled.connect(self._playlists_changed)
+        self.playlist_limit_spin = QSpinBox()
+        self.playlist_limit_spin.setRange(0, 5000)
+        self.playlist_limit_spin.setValue(int(self.settings.get("playlist_limit", 0)))
+        self.playlist_limit_spin.setSpecialValueText("All")
+        self.playlist_limit_spin.setFixedWidth(96)
+        self.playlist_limit_spin.setToolTip("A cap on how many videos one playlist contributes; 0 takes all of them")
+        self.playlist_limit_spin.valueChanged.connect(self._playlist_limit_changed)
+        self.playlist_limit_label = QLabel("Videos per playlist")
+        lg.addWidget(self.playlist_check, 0, 0, 1, 2)
+        lg.addWidget(self.playlist_limit_label, 0, 2)
+        lg.addWidget(self.playlist_limit_spin, 0, 3)
+        lg.addWidget(self.playlist_folder_check, 1, 0, 1, 4)
+        self.playlist_hint = QLabel()
+        self.playlist_hint.setObjectName("muted")
+        self.playlist_hint.setWordWrap(True)
+        lg.addWidget(self.playlist_hint, 2, 0, 1, 4)
+        lg.setColumnStretch(1, 1)
+        layout.addWidget(lists)
+
+        spot = QGroupBox("Spotify")
+        sp = QGridLayout(spot)
+        sp.setHorizontalSpacing(12)
+        self.spotify_check = QCheckBox("Queue Spotify links as the matching tracks")
+        self.spotify_check.setChecked(bool(self.settings.get("spotify", True)))
+        self.spotify_check.toggled.connect(self._spotify_changed)
+        self.spotify_source = QComboBox()
+        for label, prefix in MATCH_SOURCES:
+            self.spotify_source.addItem(label, prefix)
+        saved_source = self.settings.get("spotify_source", DEFAULT_MATCH_SOURCE)
+        index = self.spotify_source.findData(saved_source)
+        self.spotify_source.setCurrentIndex(index if index >= 0 else 0)
+        self.spotify_source.setMinimumWidth(140)
+        self.spotify_source.currentTextChanged.connect(self._spotify_changed)
+        self.spotify_source_label = QLabel("Find tracks on")
+        self.spotify_hint = QLabel()
+        self.spotify_hint.setObjectName("muted")
+        self.spotify_hint.setWordWrap(True)
+        sp.addWidget(self.spotify_check, 0, 0, 1, 2)
+        sp.addWidget(self.spotify_source_label, 0, 2)
+        sp.addWidget(self.spotify_source, 0, 3)
+        sp.addWidget(self.spotify_hint, 1, 0, 1, 4)
+        sp.setColumnStretch(1, 1)
+        layout.addWidget(spot)
+
         subs = QGroupBox("Subtitles")
         sg = QGridLayout(subs)
         sg.setHorizontalSpacing(12)
@@ -868,14 +989,29 @@ class MainWindow(QMainWindow):
         note = QLabel("Video quality is a maximum height; lower-resolution sources are never upscaled. "
                       "Audio formats download the best available audio stream and convert it with FFmpeg "
                       "(FLAC and WAV are lossless, so bitrate does not apply). "
-                      "Subtitles are skipped silently when a video offers none in the languages asked for. "
+                      "Subtitles never fail a download: when a video has none in the languages asked for, "
+                      "or the caption file will not come down, the video is kept anyway. "
                       "Settings are saved when a download starts and on exit.")
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(note)
         layout.addStretch(1)
         self._mode_changed()
+        self._spotify_changed()
+        self._playlists_changed()
         return page
+
+    @staticmethod
+    def _scrollable(page: QWidget) -> QWidget:
+        """Let a tab scroll rather than squash its controls on a short window."""
+        area = QScrollArea()
+        area.setWidget(page)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        area.viewport().setAutoFillBackground(False)
+        page.setAutoFillBackground(False)
+        return area
 
     def _build_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -934,24 +1070,45 @@ class MainWindow(QMainWindow):
         return merged
 
     def _reload_links(self) -> None:
-        if self.manager.active:
+        if self.manager.active or self._playlist_worker is not None:
             return
-        urls = self._collect_urls()
         prior = {job.url: job for job in self.jobs}
         self.jobs = []
-        for index, url in enumerate(urls, 1):
-            old = prior.get(url)
-            if not is_basic_url(url):
-                job = DownloadJob(index, url, status="Invalid")
-            elif old:
-                job = DownloadJob(index, url, title=old.title, status=old.status, progress=old.progress,
-                                  downloaded_bytes=old.downloaded_bytes, total_bytes=old.total_bytes,
-                                  output_path=old.output_path, error=old.error)
+        playlists = 0
+        for url in self._collect_urls():
+            entries = self._expanded.get(url) if self._expands(url) else None
+            if entries:
+                playlists += 1
+                for entry in entries:
+                    self._add_job(prior, entry.url, title=entry.title, playlist_title=entry.playlist_title,
+                                  playlist_url=entry.playlist_url, playlist_index=entry.playlist_index)
             else:
-                job = DownloadJob(index, url)
-            self.jobs.append(job)
-        self.count_label.setText(f"Videos found: {len(self.jobs)}")
+                self._add_job(prior, url)
+        self.count_label.setText(self._count_text(len(self.jobs), playlists))
         self._render_jobs()
+
+    def _add_job(self, prior: dict[str, DownloadJob], url: str, title: str = "", **extra: Any) -> None:
+        """Append one job, carrying over the state of a job for the same URL."""
+        index = len(self.jobs) + 1
+        if not is_queueable(url):
+            self.jobs.append(DownloadJob(index, url, title=title, status="Invalid", **extra))
+            return
+        old = prior.get(url)
+        if old:
+            self.jobs.append(DownloadJob(
+                index, url, title=old.title or title, status=old.status, progress=old.progress,
+                downloaded_bytes=old.downloaded_bytes, total_bytes=old.total_bytes,
+                output_path=old.output_path, error=old.error, note=old.note,
+                media_count=old.media_count, **extra))
+        else:
+            self.jobs.append(DownloadJob(index, url, title=title, **extra))
+
+    @staticmethod
+    def _count_text(videos: int, expanded: int) -> str:
+        text = f"Videos found: {videos}"
+        if expanded:
+            text += f"   ({expanded} link{'s' if expanded != 1 else ''} expanded)"
+        return text
 
     def _render_jobs(self) -> None:
         table = self.jobs_table
@@ -964,7 +1121,7 @@ class MainWindow(QMainWindow):
             idx.setForeground(QColor(MUTED))
             table.setItem(row, 0, idx)
             title = QTableWidgetItem(job.title or job.url)
-            title.setToolTip(job.url)
+            title.setToolTip(f"{job.playlist_title}\n{job.url}" if job.playlist_title else job.url)
             table.setItem(row, 1, title)
             bar = QProgressBar()
             bar.setRange(0, 1000)
@@ -1047,6 +1204,9 @@ class MainWindow(QMainWindow):
             self._subtitle_mode(),
             self.subs_lang_edit.text().strip() or DEFAULT_SUBTITLE_LANGS,
             self.subs_auto_check.isChecked(),
+            self.playlist_check.isChecked(),
+            self.playlist_limit_spin.value(),
+            self.playlist_folder_check.isChecked(),
         )
 
     def _format_changed(self, _: str = "") -> None:
@@ -1119,24 +1279,146 @@ class MainWindow(QMainWindow):
         return False
 
     def _start(self) -> None:
+        if self._playlist_worker is not None:
+            return
         self._reload_links()
-        pending = [j for j in self.jobs if j.status in {"Queued", *RETRYABLE} and is_basic_url(j.url)]
-        if not pending:
+        if not self.jobs:
             QMessageBox.information(self, "Nothing to download", "Add at least one valid URL via the links file or the direct links box.")
             return
         if not self._require_ffmpeg():
             return
+        if self._expand_playlists_then_start():
+            return
+        self._start_pending()
+
+    def _start_pending(self) -> None:
+        pending = [j for j in self.jobs if j.status in {"Queued", *RETRYABLE} and is_queueable(j.url)]
+        if not pending:
+            QMessageBox.information(self, "Nothing to download", "Add at least one valid URL via the links file or the direct links box.")
+            return
         self._launch(pending)
+
+    # ----------------------------------------------------------- playlists
+    def _playlists_changed(self, _checked: bool = False) -> None:
+        on = self.playlist_check.isChecked()
+        for widget in (self.playlist_limit_label, self.playlist_limit_spin, self.playlist_folder_check):
+            widget.setEnabled(on)
+        if on:
+            limit = self.playlist_limit_spin.value()
+            cap = "every video" if limit == 0 else f"the first {limit} videos"
+            where = "its own subfolder" if self.playlist_folder_check.isChecked() else "the output folder"
+            self.playlist_hint.setText(
+                f"A playlist, channel or album link is read first and queued as {cap} it holds, "
+                f"each one its own row with its own progress, saved into {where}. A post holding "
+                f"several photos or clips, such as an Instagram carousel, comes down in full."
+            )
+        else:
+            self.playlist_hint.setText(
+                "One link, one file: a playlist link brings down a single video, and only the "
+                "first item of a post that holds several."
+            )
+        # Called while the Settings tab is still being built, before the
+        # bottom bar exists; the first real render comes right after.
+        if hasattr(self, "retry_btn") and not self.manager.active:
+            self._reload_links()
+
+    def _spotify_changed(self, _value: Any = None) -> None:
+        on = self.spotify_check.isChecked()
+        for widget in (self.spotify_source_label, self.spotify_source):
+            widget.setEnabled(on)
+        if on:
+            where = self.spotify_source.currentText()
+            self.spotify_hint.setText(
+                f"Spotify streams are copy-protected, so nothing is taken from Spotify itself. "
+                f"A track, album or playlist link is read for what is on it, and each track is "
+                f"queued as the closest match on {where}."
+            )
+        else:
+            self.spotify_hint.setText("Spotify links are left alone, and will fail as unsupported.")
+        # A different source means different matches, so drop what was read.
+        self._expanded = {url: entries for url, entries in self._expanded.items()
+                          if not looks_like_spotify(url)}
+        self._not_playlists = {url for url in self._not_playlists if not looks_like_spotify(url)}
+        if hasattr(self, "retry_btn") and not self.manager.active:
+            self._reload_links()
+
+    def _playlist_limit_changed(self, _value: int = 0) -> None:
+        # A different cap means a different set of videos, so what was read
+        # earlier is no longer the answer.
+        self._expanded.clear()
+        self._not_playlists.clear()
+        self._playlists_changed()
+
+    def _expands(self, url: str) -> bool:
+        """Whether this link may turn into several queue rows."""
+        if looks_like_spotify(url):
+            return self.spotify_check.isChecked()
+        return self.playlist_check.isChecked() and looks_like_playlist(url)
+
+    def _playlist_candidates(self) -> list[str]:
+        """Collected links that may expand and have not been read yet."""
+        return [url for url in self._collect_urls()
+                if is_basic_url(url) and self._expands(url)
+                and url not in self._expanded and url not in self._not_playlists]
+
+    def _expand_playlists_then_start(self) -> bool:
+        """Start reading the links that expand; True when the batch must wait."""
+        candidates = self._playlist_candidates()
+        if not candidates:
+            return False
+        worker = PlaylistWorker(candidates, self.playlist_limit_spin.value(),
+                                self.spotify_source.currentData() or DEFAULT_MATCH_SOURCE, self.logger)
+        worker.progressed.connect(self.status_label.setText)
+        worker.finished_ok.connect(self._playlists_expanded)
+        worker.finished.connect(worker.deleteLater)
+        self._playlist_worker = worker
+        self.start_btn.setEnabled(False)
+        self.retry_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.status_label.setText(
+            f"Reading {len(candidates)} link{'s' if len(candidates) != 1 else ''}…")
+        worker.start()
+        return True
+
+    def _playlists_expanded(self, found: dict, problems: list, cancelled: bool) -> None:
+        self._playlist_worker = None
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        for url, entries in found.items():
+            self._expanded[url] = entries
+        # Links that turned out to be a single video, or could not be read at
+        # all, are remembered so Start does not probe them again.
+        for url in self._playlist_candidates():
+            if url not in found:
+                self._not_playlists.add(url)
+        self._reload_links()
+        if cancelled:
+            self.status_label.setText("Cancelled while reading links.")
+            return
+        added = sum(len(entries) for entries in found.values())
+        if added:
+            self.status_label.setText(
+                f"{len(found)} link{'s' if len(found) != 1 else ''} queued as {added} items.")
+        if problems:
+            self.logger.info("%d link(s) did not expand", len(problems))
+            # A playlist that would not open quietly falls back to one video,
+            # but a Spotify link that cannot be read has nothing to fall back
+            # to, so say why before the job fails as an unsupported URL.
+            stuck = next(((url, why) for url, why in problems if looks_like_spotify(url)), None)
+            if stuck:
+                self.status_label.setText(f"Could not read that Spotify link — {stuck[1]}")
+        self._start_pending()
 
     def _retry_failed(self) -> None:
         self._retry_jobs([j for j in self.jobs if j.status in RETRYABLE])
 
     def _retry_jobs(self, jobs: list[DownloadJob]) -> None:
-        jobs = [j for j in jobs if j.status in RETRYABLE and is_basic_url(j.url)]
+        jobs = [j for j in jobs if j.status in RETRYABLE and is_queueable(j.url)]
         if not jobs or self.manager.active:
             return
         for job in jobs:
             job.status, job.error, job.output_path = "Queued", "", ""
+            job.note, job.media_count = "", 0
             job.progress, job.downloaded_bytes, job.total_bytes, job.speed, job.eta = 0.0, 0, None, None, None
             self._sync_row(job)
         self._update_summary()
@@ -1159,6 +1441,11 @@ class MainWindow(QMainWindow):
             self._sync_row(job)
 
     def _cancel(self) -> None:
+        if self._playlist_worker is not None:
+            self._playlist_worker.cancel.set()
+            self.cancel_btn.setEnabled(False)
+            self.status_label.setText("Cancelling…")
+            return
         self.manager.cancel()
         self.cancel_btn.setEnabled(False)
         self.status_label.setText("Cancelling…")
@@ -1196,11 +1483,15 @@ class MainWindow(QMainWindow):
             return
         if kind == "metadata":
             job.title = event["title"]
+        elif kind == "media_count":
+            job.media_count = int(event.get("count") or 0)
         elif kind == "progress":
             job.downloaded_bytes, job.total_bytes = event["downloaded"], event["total"]
             job.speed, job.eta, job.progress = event["speed"], event["eta"], event["progress"]
         elif kind == "status":
             job.status, job.error, job.output_path = event["status"], event.get("error", ""), event.get("output_path", "")
+            job.note = event.get("note", "")
+            job.media_count = int(event.get("media_count") or 0)
             if job.status in TERMINAL:
                 self._record_history(job)
             self._update_summary()
@@ -1337,6 +1628,11 @@ class MainWindow(QMainWindow):
             "mode": self.mode_box.currentText(),
             "workers": self.workers_spin.value(),
             "skip_existing": self.skip_check.isChecked(),
+            "playlists": self.playlist_check.isChecked(),
+            "playlist_limit": self.playlist_limit_spin.value(),
+            "playlist_folders": self.playlist_folder_check.isChecked(),
+            "spotify": self.spotify_check.isChecked(),
+            "spotify_source": self.spotify_source.currentData() or DEFAULT_MATCH_SOURCE,
             "ffmpeg_path": self.ffmpeg_edit.text(),
             "search_limit": self.search_limit.value(),
         }
@@ -1359,6 +1655,9 @@ class MainWindow(QMainWindow):
             "status": job.status,
             "output_path": job.output_path,
             "error": job.error,
+            "note": job.note,
+            "playlist": job.playlist_title,
+            "media_count": job.media_count,
             "downloaded_bytes": job.downloaded_bytes,
             "total_bytes": job.total_bytes,
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1492,6 +1791,9 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def _shutdown(self) -> None:
+        if self._playlist_worker is not None:
+            self._playlist_worker.cancel.set()
+            self._playlist_worker.wait(3000)
         if self.manager.active:
             self.manager.cancel()
         self._save_settings()

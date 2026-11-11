@@ -2,7 +2,8 @@
 
 A focused desktop app for downloading batches of videos supported by
 yt-dlp. The interface is built with PySide6 (Qt) and keeps all downloads off
-the GUI thread, with per-video progress, retries, cancellation, persistent
+the GUI thread, with per-video progress, retries, cancellation, playlist and
+channel expansion, multi-media posts, Spotify track matching, persistent
 history, system-tray support, and settings persistence.
 
 ## Requirements
@@ -54,6 +55,64 @@ appends them there.
 expands the row automatically). When both are in use the two sources are
 merged and de-duplicated with order preserved. Malformed entries remain
 visible as `Invalid` and are skipped.
+
+## Playlists and channels
+
+Settings has a **Playlists and channels** group, on by default. With it on, a
+link to a playlist, channel, album, or set is read once when you press **Start
+download** and queued as the individual videos behind it, each with its own
+row, progress bar, status, and Retry button. Titles come from that single
+listing request, so a long playlist resolves in seconds rather than one request
+per video.
+
+**Videos per playlist** caps how many videos one link contributes — useful
+against a channel with thousands of uploads — and `All` (0) takes every one.
+Changing the cap re-reads the links on the next Start. **Save each playlist in
+its own subfolder** puts the videos under a folder named after the playlist
+inside the output folder, with characters Windows rejects replaced.
+
+What was read is remembered for the session, so a second **Start** does not go
+back to the network, and the count under the Links box reports how many links
+expanded. A link that cannot be read as a playlist — a YouTube mix, a private
+list — is not an error: it falls back to downloading the single video it points
+at. With the option off, a playlist link brings down only that one video.
+
+## Posts with several photos or clips
+
+An Instagram carousel is one post holding up to twenty photos and clips. It is
+not a playlist — every item lives at the same address and carries the same
+title — so it stays a single row in the queue and writes one file per item,
+named `<title> - <n> [<id>].<ext>` so the items neither overwrite each other nor
+collide with another post from the same account. The row then reads
+`Done • 3 files`. The same applies to any other site that serves one link as
+several media.
+
+This follows the **Playlists and channels** switch: with it off, one link means
+one file and only the first item of such a post is fetched. Audio-only formats
+do not mix with these posts — a photo has no soundtrack to extract, and the job
+fails on it — so download carousels as video.
+
+## Spotify links
+
+Spotify's own streams are copy-protected and yt-dlp lists `open.spotify.com`
+among the sites it cannot download; nothing here changes that, and nothing is
+taken from Spotify itself. What the **Spotify** group in Settings does, when on,
+is read a `track`, `album`, `playlist` or `artist` link for *what is on it* —
+through the public embed page, which needs no account or API key — and queue
+each track as the closest match on **YouTube** or **SoundCloud**, your choice
+under **Find tracks on**.
+
+Each track becomes its own row, showing `Artist — Title` from Spotify until the
+matched video's real title arrives. An album or playlist goes into a subfolder
+named after it, under the same **Save each playlist in its own subfolder**
+setting; a single track link does not. **Videos per playlist** caps a long
+playlist the same way it caps a YouTube one. Matching is a search, so a track
+with an ambiguous name can match the wrong upload — the row shows what was
+actually downloaded. Pick an audio format in the **Format** box to end up with
+files rather than videos.
+
+With the group switched off, a Spotify link is left alone and fails as an
+unsupported URL.
 
 ## Searching for videos
 
@@ -128,9 +187,15 @@ auto-generated captions can be accepted when a video has no human-made track.
 Embedding runs through FFmpeg, so it needs the same FFmpeg as audio downloads
 and offers the built-in download if none is found; sidecar files are converted
 to `.srt` when FFmpeg is available and otherwise kept in whatever format the
-site serves. A video that offers no captions in the languages asked for still
-downloads — the subtitle step is simply skipped. Audio-only formats ignore
-subtitles, and the group says so.
+site serves. Audio-only formats ignore subtitles, and the group says so.
+
+Captions never cost you the video. The request is first narrowed to the
+languages a video actually offers, so asking for `en` on a video without
+English captions downloads it with no captions instead of warning or failing.
+If the caption step still breaks — a 429 from the subtitle server, an FFmpeg
+convert or embed error — the video is downloaded again without subtitles rather
+than reported as failed, the row reads `Done … no subtitles`, and the reason is
+written to `download.log`.
 
 ## Quality and downloads
 
