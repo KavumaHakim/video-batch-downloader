@@ -8,6 +8,7 @@ import logging
 import re
 import sys
 import threading
+from collections import Counter
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
@@ -43,6 +44,13 @@ HISTORY_FILE = APP_DIR / "download_history.json"
 ICON_ICO = BUNDLE_DIR / "assets" / "app_icon.ico"
 ICON_PNG = BUNDLE_DIR / "assets" / "app_icon.png"
 UI_ASSETS = BUNDLE_DIR / "assets" / "ui"
+
+HISTORY_TAB = 2
+# Most events a single poll may handle, so a busy batch cannot starve repaints.
+EVENTS_PER_TICK = 500
+# Entries kept on disk and in the History table. A few long playlists would
+# otherwise grow the file without limit, and every redraw with it.
+HISTORY_LIMIT = 2000
 
 TERMINAL = {"Completed", "Failed", "Cancelled", "Skipped"}
 RETRYABLE = {"Failed", "Cancelled"}
@@ -398,6 +406,10 @@ class MainWindow(QMainWindow):
         self.job_rows: dict[int, dict[str, Any]] = {}
         self.settings = self._load_settings()
         self.history: list[dict[str, Any]] = self._load_history()
+        self._history_index: dict[tuple[str, str], int] = {}
+        self._history_dirty = False
+        self._history_stale = False
+        self._reindex_history()
         self._exiting = False
         self._tray_hint_shown = False
         self.tray: QSystemTrayIcon | None = None
@@ -423,6 +435,14 @@ class MainWindow(QMainWindow):
         self._reload_timer.setSingleShot(True)
         self._reload_timer.setInterval(400)
         self._reload_timer.timeout.connect(self._reload_links)
+
+        # Saving history and redrawing its table wait for a run of finished
+        # jobs to settle, so a long playlist does not do either per video.
+        self._history_timer = QTimer(self)
+        self._history_timer.setSingleShot(True)
+        self._history_timer.setInterval(1500)
+        self._history_timer.timeout.connect(self._settle_history)
+        self.tabs.currentChanged.connect(self._tab_changed)
 
         self._poll = QTimer(self)
         self._poll.setInterval(100)
@@ -1138,18 +1158,25 @@ class MainWindow(QMainWindow):
             status = QTableWidgetItem()
             status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(row, 4, status)
-            retry = QPushButton("Retry")
-            retry.setObjectName("small")
-            retry.clicked.connect(lambda _=False, j=job: self._retry_jobs([j]))
-            rw = QWidget()
-            rl = QHBoxLayout(rw)
-            rl.setContentsMargins(4, 3, 6, 3)
-            rl.addWidget(retry)
-            retry.setMinimumWidth(64)
-            table.setCellWidget(row, 5, rw)
-            self.job_rows[job.job_id] = {"row": row, "bar": bar, "retry": retry, "title": title, "detail": detail, "status": status}
+            # The Retry button is built only once a row can actually use it:
+            # a channel with thousands of videos would otherwise pay for
+            # thousands of hidden buttons before anything is downloaded.
+            self.job_rows[job.job_id] = {"row": row, "bar": bar, "retry": None, "title": title,
+                                         "detail": detail, "status": status}
             self._sync_row(job)
         self._update_summary()
+
+    def _retry_button(self, job: DownloadJob, row: int) -> QPushButton:
+        retry = QPushButton("Retry")
+        retry.setObjectName("small")
+        retry.setMinimumWidth(64)
+        retry.clicked.connect(lambda _=False, j=job: self._retry_jobs([j]))
+        holder = QWidget()
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(4, 3, 6, 3)
+        layout.addWidget(retry)
+        self.jobs_table.setCellWidget(row, 5, holder)
+        return retry
 
     def _sync_row(self, job: DownloadJob) -> None:
         w = self.job_rows.get(job.job_id)
@@ -1158,7 +1185,12 @@ class MainWindow(QMainWindow):
         w["title"].setText(job.title or job.url)
         w["status"].setText(job.status)
         w["status"].setForeground(QColor(STATUS_COLORS.get(job.status, TEXT)))
-        w["retry"].setVisible(job.status in RETRYABLE and not self.manager.active)
+        wants_retry = job.status in RETRYABLE and not self.manager.active
+        retry = w["retry"]
+        if retry is None and wants_retry:
+            retry = w["retry"] = self._retry_button(job, w["row"])
+        if retry is not None:
+            retry.setVisible(wants_retry)
         text = job_detail(job)
         w["detail"].setText(text)
         w["detail"].setToolTip(text if job.status == "Failed" else "")
@@ -1171,15 +1203,15 @@ class MainWindow(QMainWindow):
             bar.setValue(1000 if job.status in {"Completed", "Skipped"} else int(job.progress * 1000))
 
     def _update_summary(self) -> None:
-        completed = sum(j.status == "Completed" for j in self.jobs)
-        downloading = sum(j.status == "Downloading" for j in self.jobs)
-        queued = sum(j.status == "Queued" for j in self.jobs)
-        failed = sum(j.status == "Failed" for j in self.jobs)
-        skipped = sum(j.status == "Skipped" for j in self.jobs)
+        # One pass: this runs on every status event, of which a long playlist
+        # produces thousands.
+        tally: Counter[str] = Counter(job.status for job in self.jobs)
+        completed, downloading = tally["Completed"], tally["Downloading"]
+        queued, failed, skipped = tally["Queued"], tally["Failed"], tally["Skipped"]
         self.summary_label.setText(
             f"{completed} / {len(self.jobs)} completed   •   {downloading} downloading   •   {queued} queued   •   {skipped} skipped   •   {failed} failed"
         )
-        retryable = any(j.status in RETRYABLE for j in self.jobs) and not self.manager.active
+        retryable = bool(tally.keys() & RETRYABLE) and not self.manager.active
         self.retry_btn.setEnabled(retryable)
 
     # ------------------------------------------------------------- actions
@@ -1452,8 +1484,11 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- events
     def _poll_events(self) -> None:
+        # Bounded on purpose: a large batch can queue events faster than they
+        # can be drawn, and draining without limit would stop the window
+        # repainting. Whatever is left waits for the next tick, 100ms away.
         try:
-            while True:
+            for _ in range(EVENTS_PER_TICK):
                 self._handle_event(self.events.get_nowait())
         except Empty:
             pass
@@ -1644,9 +1679,40 @@ class MainWindow(QMainWindow):
     def _load_history(self) -> list[dict[str, Any]]:
         try:
             data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
+            return data[-HISTORY_LIMIT:] if isinstance(data, list) else []
         except (OSError, json.JSONDecodeError):
             return []
+
+    def _reindex_history(self) -> None:
+        """Rebuild the (url, status) -> position map used to update entries.
+
+        Without it, recording a finished job meant scanning the whole history,
+        which turns a long playlist into quadratic work.
+        """
+        self._history_index = {(entry.get("url", ""), entry.get("status", "")): position
+                               for position, entry in enumerate(self.history)}
+
+    def _history_changed(self) -> None:
+        """Note that history moved on; the disk write and redraw are batched.
+
+        A 500-video playlist finishes 500 jobs. Writing the file and rebuilding
+        the table for each one is what used to wedge the app, so both wait for
+        the run of completions to settle.
+        """
+        self._history_dirty = True
+        self._history_stale = True
+        self._history_timer.start()
+
+    def _settle_history(self) -> None:
+        if self._history_dirty:
+            self._flush_history()
+        if self._history_stale and self.tabs.currentIndex() == HISTORY_TAB:
+            self._render_history()
+
+    def _tab_changed(self, index: int) -> None:
+        # The table is only worth rebuilding when someone is looking at it.
+        if index == HISTORY_TAB and self._history_stale:
+            self._render_history()
 
     def _record_history(self, job: DownloadJob) -> None:
         entry = {
@@ -1662,26 +1728,34 @@ class MainWindow(QMainWindow):
             "total_bytes": job.total_bytes,
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         }
-        for i, existing in enumerate(self.history):
-            if existing.get("url") == job.url and existing.get("status") == job.status:
-                self.history[i] = entry
-                break
+        key = (job.url, job.status)
+        position = self._history_index.get(key)
+        if position is not None:
+            self.history[position] = entry
         else:
+            self._history_index[key] = len(self.history)
             self.history.append(entry)
-        self._flush_history()
-        self._render_history()
+        self._history_changed()
 
     def _write_history(self) -> None:
         for job in self.jobs:
             if job.status in TERMINAL:
                 self._record_history(job)
         self._flush_history()
+        self._history_stale = True
+        if self.tabs.currentIndex() == HISTORY_TAB:
+            self._render_history()
 
     def _flush_history(self) -> None:
+        if len(self.history) > HISTORY_LIMIT:
+            # Keep the file, and the table built from it, to a workable size.
+            self.history = self.history[-HISTORY_LIMIT:]
+            self._reindex_history()
         try:
             HISTORY_FILE.write_text(json.dumps(self.history, indent=2), encoding="utf-8")
         except OSError as exc:
             self.logger.error("Failed to write history: %s", exc)
+        self._history_dirty = False
 
     def _render_history(self) -> None:
         table = self.history_table
@@ -1728,6 +1802,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         self.history = []
+        self._reindex_history()
         self._flush_history()
         self._render_history()
 

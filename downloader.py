@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,8 @@ DEFAULT_SUBTITLE_LANGS = "en"
 SUBTITLE_TROUBLE = re.compile(r"subtitle|caption|\.srt|\.vtt", re.IGNORECASE)
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 NOTE_NO_SUBTITLES = "Subtitles were unavailable - downloaded without them"
+# Smallest gap between progress updates sent to the GUI, per job.
+PROGRESS_INTERVAL = 0.15
 
 # URLs worth probing for a playlist. A false positive only costs one extraction
 # that comes back as a single video, so these lean towards catching too much.
@@ -548,6 +551,14 @@ class DownloadManager:
                 job.speed = float(data["speed"]) if data.get("speed") else None
                 job.eta = int(data["eta"]) if data.get("eta") is not None else None
                 job.progress = downloaded / job.total_bytes if job.total_bytes else 0.0
+                # yt-dlp calls this for every chunk. A row can only show so
+                # much, so several downloads at once do not need to push
+                # thousands of events a second at the window.
+                now = time.monotonic()
+                if state is not None and now - state.get("last_emit", 0.0) < PROGRESS_INTERVAL:
+                    return
+                if state is not None:
+                    state["last_emit"] = now
                 self._emit({"type": "progress", "job_id": job.job_id, "downloaded": downloaded,
                             "total": job.total_bytes, "speed": job.speed, "eta": job.eta,
                             "progress": job.progress})
