@@ -59,6 +59,18 @@ NOTE_NO_SUBTITLES = "Subtitles were unavailable - downloaded without them"
 # Smallest gap between progress updates sent to the GUI, per job.
 PROGRESS_INTERVAL = 0.15
 
+# The site pushing back, rather than one video being unavailable. A long batch
+# of searches is enough to earn this from YouTube: the watch page starts coming
+# back incomplete, which leaves yt-dlp without the visitor data its playback
+# token is bound to, and the media URLs then answer 403.
+RATE_LIMITED = re.compile(
+    r"HTTP Error 429|Too Many Requests|HTTP Error 403|Forbidden"
+    r"|Sign in to confirm|not a bot|temporarily blocked|try again later",
+    re.IGNORECASE,
+)
+# How long the whole batch holds off after each knock-back.
+RATE_LIMIT_BACKOFF = (20.0, 60.0)
+
 # URLs worth probing for a playlist. A false positive only costs one extraction
 # that comes back as a single video, so these lean towards catching too much.
 PLAYLIST_URL_HINTS = re.compile(
@@ -97,6 +109,8 @@ class DownloadConfig:
     playlists: bool = True       # expand playlist/channel links into their videos
     playlist_limit: int = 0      # videos taken per playlist; 0 = every one
     playlist_folders: bool = True  # save each playlist into its own subfolder
+    request_pause: float = 0.75  # seconds between requests; 0 asks as fast as it can
+    rate_limit_retries: int = 2  # goes at a throttled download before giving up
 
     @property
     def audio_only(self) -> bool:
@@ -235,6 +249,10 @@ class DownloadManager:
         self._futures: list[Future[None]] = []
         self._lock = threading.Lock()
         self._active = False
+        # Being throttled is a fact about this connection, not about one video,
+        # so the pause it earns applies to every worker.
+        self._cooldown_lock = threading.Lock()
+        self._cooldown_until = 0.0
 
     @property
     def active(self) -> bool:
@@ -259,6 +277,8 @@ class DownloadManager:
 
         config.output_dir.mkdir(parents=True, exist_ok=True)
         self.cancel_event.clear()
+        with self._cooldown_lock:
+            self._cooldown_until = 0.0
         with self._lock:
             self._active = True
         max_workers = 1 if config.mode == "Sequential" else max(1, min(config.workers, 5))
@@ -283,13 +303,63 @@ class DownloadManager:
             self._active = False
         self._emit({"type": "batch_complete"})
 
+    def _start_cooldown(self, seconds: float) -> None:
+        """Hold the whole batch back for a while."""
+        with self._cooldown_lock:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + seconds)
+
+    def _hold_for_cooldown(self, job: DownloadJob) -> bool:
+        """Wait out a cooldown another worker may have started.
+
+        Returns False when the batch was cancelled while waiting.
+        """
+        waiting = False
+        while not self.cancel_event.is_set():
+            with self._cooldown_lock:
+                remaining = self._cooldown_until - time.monotonic()
+            if remaining <= 0:
+                return True
+            if not waiting:
+                waiting = True
+                self._status(job, "Waiting")
+            self.cancel_event.wait(min(remaining, 0.5))
+        return False
+
     def _download_one(self, job: DownloadJob, config: DownloadConfig) -> None:
         if self.cancel_event.is_set():
             self._status(job, "Cancelled")
             return
 
-        self._status(job, "Downloading")
         self.logger.info("Starting: %s | %s", job.url, job.title or "untitled")
+        rounds = max(0, config.rate_limit_retries)
+        for round_index in range(rounds + 1):
+            if not self._hold_for_cooldown(job):
+                self._status(job, "Cancelled")
+                return
+            self._status(job, "Downloading")
+            message = self._run_once(job, config)
+            if message is None:
+                self._status(job, "Cancelled")
+                return
+            if not message:
+                return                       # finished; _run_once set the status
+            if round_index >= rounds or not RATE_LIMITED.search(message):
+                job.error = message
+                self._status(job, "Failed", error=message)
+                self.logger.error("Failed: %s | %s", job.url, message)
+                return
+            # Being refused is about the connection, so every worker waits.
+            pause = RATE_LIMIT_BACKOFF[min(round_index, len(RATE_LIMIT_BACKOFF) - 1)]
+            self._start_cooldown(pause)
+            self.logger.warning("Throttled on %s; holding the batch %.0fs before trying again: %s",
+                                job.url, pause, message)
+
+    def _run_once(self, job: DownloadJob, config: DownloadConfig) -> Optional[str]:
+        """One go at the job, subtitle fallback included.
+
+        Returns "" once it has finished and set its own status, None if the
+        batch was cancelled, or the error to be judged by the caller.
+        """
         # Captions are a nice-to-have: try with them, and when they are what
         # broke, fall back to a plain download instead of failing the video.
         attempts = [True, False] if config.wants_subtitles else [False]
@@ -300,8 +370,7 @@ class DownloadManager:
                 outcome = self._attempt(job, config, with_subtitles, state)
             except Exception as exc:
                 if self.cancel_event.is_set():
-                    self._status(job, "Cancelled")
-                    return
+                    return None
                 message = clean_error(exc) or exc.__class__.__name__
                 # Either the message blames subtitles, or the video itself had
                 # already arrived and only the caption step afterwards broke.
@@ -310,23 +379,20 @@ class DownloadManager:
                     self.logger.warning(
                         "Subtitles failed for %s, retrying without them: %s", job.url, message)
                     continue
-                job.error = message
-                self._status(job, "Failed", error=message)
-                self.logger.error("Failed: %s | %s", job.url, message)
-                return
+                return message
             if self.cancel_event.is_set():
-                self._status(job, "Cancelled")
-                return
+                return None
             if outcome == "skipped" and index == 0:
                 self._status(job, "Skipped")
                 self.logger.info("Skipped existing file: %s", job.url)
-                return
+                return ""
             # A skip on the retry means the first pass had already written the
             # file before the caption step tripped, so it really did complete.
             self._status(job, "Completed")
             self.logger.info("Completed: %s | %s%s", job.url, job.output_path,
                              f" ({job.note})" if job.note else "")
-            return
+            return ""
+        return ""
 
     def _attempt(
         self,
@@ -469,6 +535,14 @@ class DownloadManager:
             # One link, one file. This also keeps the probe below from walking
             # a whole playlist just to find out how long it is.
             options["playlistend"] = 1
+        if config.request_pause > 0:
+            # Spacing the extraction requests is what keeps a long batch from
+            # being throttled: each job asks for a search page, a watch page
+            # and a player response, and it is the watch page coming back
+            # incomplete that costs us playable media URLs.
+            options["sleep_interval_requests"] = config.request_pause
+            options["sleep_interval"] = config.request_pause
+            options["max_sleep_interval"] = config.request_pause * 2
         # Point yt-dlp at whatever we resolved rather than letting it search PATH
         # on its own: an auto-downloaded FFmpeg lives beside the app, not on PATH.
         # The directory is passed so ffprobe is picked up alongside ffmpeg.

@@ -210,6 +210,33 @@ uses retries for temporary failures, and merges to MP4 when FFmpeg is
 available. Existing final files can be skipped; `.part` files alone are not
 treated as completed files.
 
+## When a site throttles you
+
+A long batch asks a lot of one site in a short time — each download costs a
+search, a page fetch and a player request — and the site eventually starts
+refusing. On YouTube that shows up in a particular way: the watch page begins
+coming back incomplete, which leaves yt-dlp without the visitor data its
+playback token is bound to, and the media URLs then answer `403 Forbidden`.
+The 403 is three steps downstream of the real cause, which is simply asking too
+fast.
+
+Two settings in **Download options** deal with it:
+
+| Setting | Does |
+|---|---|
+| **Pause between requests** | A gap between the requests each download makes. This is prevention, and it is where it counts — the page fetch is what breaks first. `Off` asks as fast as possible. Default 0.75s. |
+| **Retry if throttled** | How many further goes a download gets when the site turns it away, rather than the video genuinely being unavailable. Default 2; `0` reports the first refusal as a failure. |
+
+Being refused is a fact about the connection, not about one video, so a
+download that is turned away holds **the whole batch** back — 20 seconds, then
+60 — instead of the other workers carrying on and digging the hole deeper.
+Affected rows read `Holding off — the site is rate limiting` while they wait.
+Errors that mean the video really is unavailable are not retried and fail
+straight away, so a dead link still fails fast.
+
+If a batch is still being refused, lower the worker count, raise the pause, or
+come back later; the block is on your connection and lifts on its own.
+
 ## Building a standalone executable
 
 ```powershell

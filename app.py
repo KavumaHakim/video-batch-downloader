@@ -20,7 +20,7 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequ
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QProgressDialog, QScrollArea, QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget,
+    QDoubleSpinBox, QProgressDialog, QScrollArea, QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget,
     QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -60,6 +60,7 @@ STATUS_COLORS = {
     "Failed": "#ff7b72",
     "Cancelled": "#ffa657",
     "Downloading": "#58a6ff",
+    "Waiting": "#d29922",
     "Invalid": "#8b949e",
     "Queued": "#c9d1d9",
 }
@@ -266,6 +267,8 @@ def job_detail(job: DownloadJob) -> str:
         return f"{done}  •  no subtitles" if job.note else done
     if job.status == "Skipped":
         return "Already downloaded"
+    if job.status == "Waiting":
+        return "Holding off — the site is rate limiting"
     if job.status == "Cancelled":
         return "Cancelled"
     if job.status == "Invalid":
@@ -922,6 +925,31 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("Workers"), 0, 4)
         form.addWidget(self.workers_spin, 0, 5)
         form.addWidget(self.skip_check, 1, 0, 1, 6)
+
+        self.pause_spin = QDoubleSpinBox()
+        self.pause_spin.setRange(0.0, 5.0)
+        self.pause_spin.setSingleStep(0.25)
+        self.pause_spin.setDecimals(2)
+        self.pause_spin.setSuffix(" s")
+        self.pause_spin.setSpecialValueText("Off")
+        self.pause_spin.setValue(float(self.settings.get("request_pause", 0.75)))
+        self.pause_spin.setToolTip("A gap between the requests each download makes, so a long "
+                                   "batch is less likely to be throttled")
+        self.pause_spin.valueChanged.connect(self._pacing_changed)
+        self.throttle_retry_spin = QSpinBox()
+        self.throttle_retry_spin.setRange(0, 5)
+        self.throttle_retry_spin.setValue(int(self.settings.get("rate_limit_retries", 2)))
+        self.throttle_retry_spin.setToolTip("How many further goes a download gets when the site "
+                                            "turns it away rather than the video being unavailable")
+        self.throttle_retry_spin.valueChanged.connect(self._pacing_changed)
+        form.addWidget(QLabel("Pause between requests"), 2, 0)
+        form.addWidget(self.pause_spin, 2, 1)
+        form.addWidget(QLabel("Retry if throttled"), 2, 2)
+        form.addWidget(self.throttle_retry_spin, 2, 3)
+        self.pacing_hint = QLabel()
+        self.pacing_hint.setObjectName("muted")
+        self.pacing_hint.setWordWrap(True)
+        form.addWidget(self.pacing_hint, 3, 0, 1, 6)
         form.setColumnStretch(1, 1)
         form.setColumnStretch(3, 1)
         layout.addWidget(opts)
@@ -1017,6 +1045,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(note)
         layout.addStretch(1)
         self._mode_changed()
+        self._pacing_changed()
         self._spotify_changed()
         self._playlists_changed()
         return page
@@ -1207,7 +1236,8 @@ class MainWindow(QMainWindow):
         # produces thousands.
         tally: Counter[str] = Counter(job.status for job in self.jobs)
         completed, downloading = tally["Completed"], tally["Downloading"]
-        queued, failed, skipped = tally["Queued"], tally["Failed"], tally["Skipped"]
+        queued = tally["Queued"] + tally["Waiting"]
+        failed, skipped = tally["Failed"], tally["Skipped"]
         self.summary_label.setText(
             f"{completed} / {len(self.jobs)} completed   •   {downloading} downloading   •   {queued} queued   •   {skipped} skipped   •   {failed} failed"
         )
@@ -1239,6 +1269,8 @@ class MainWindow(QMainWindow):
             self.playlist_check.isChecked(),
             self.playlist_limit_spin.value(),
             self.playlist_folder_check.isChecked(),
+            self.pause_spin.value(),
+            self.throttle_retry_spin.value(),
         )
 
     def _format_changed(self, _: str = "") -> None:
@@ -1353,6 +1385,22 @@ class MainWindow(QMainWindow):
         # bottom bar exists; the first real render comes right after.
         if hasattr(self, "retry_btn") and not self.manager.active:
             self._reload_links()
+
+    def _pacing_changed(self, _value: Any = None) -> None:
+        pause, retries = self.pause_spin.value(), self.throttle_retry_spin.value()
+        if pause > 0:
+            text = (f"Each download waits about {pause:.2f}s between the requests it makes, "
+                    f"which is what keeps a long batch from being throttled.")
+        else:
+            text = ("Requests go out as fast as they can, which a long batch of them tends to "
+                    "earn a block for.")
+        if retries:
+            text += (f" A download turned away by the site gets {retries} more "
+                     f"{'go' if retries == 1 else 'goes'}, and the whole batch holds off in "
+                     f"between rather than burning through the queue.")
+        else:
+            text += " A download turned away by the site is reported as failed straight away."
+        self.pacing_hint.setText(text)
 
     def _spotify_changed(self, _value: Any = None) -> None:
         on = self.spotify_check.isChecked()
@@ -1666,6 +1714,8 @@ class MainWindow(QMainWindow):
             "playlists": self.playlist_check.isChecked(),
             "playlist_limit": self.playlist_limit_spin.value(),
             "playlist_folders": self.playlist_folder_check.isChecked(),
+            "request_pause": self.pause_spin.value(),
+            "rate_limit_retries": self.throttle_retry_spin.value(),
             "spotify": self.spotify_check.isChecked(),
             "spotify_source": self.spotify_source.currentData() or DEFAULT_MATCH_SOURCE,
             "ffmpeg_path": self.ffmpeg_edit.text(),
