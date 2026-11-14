@@ -40,6 +40,7 @@ class DownloadJob:
     playlist_url: str = ""
     playlist_index: int = 0
     media_count: int = 0        # >1 for a post holding several photos or clips
+    thumbnail: str = ""         # artwork URL, when the source offered one
 
 
 # Codec -> container extension yt-dlp writes after FFmpegExtractAudio.
@@ -139,6 +140,7 @@ class PlaylistEntry:
     playlist_title: str = ""
     playlist_url: str = ""
     playlist_index: int = 0
+    thumbnail: str = ""
 
 
 def looks_like_playlist(url: str) -> bool:
@@ -169,6 +171,18 @@ def _entry_url(entry: dict[str, Any]) -> str:
         if value and str(value).startswith("http"):
             return str(value)
     return ""
+
+
+def best_thumbnail(entry: dict[str, Any]) -> str:
+    """Pick artwork near card size rather than the full-resolution original."""
+    if entry.get("thumbnail"):
+        return str(entry["thumbnail"])
+    candidates = [t for t in (entry.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
+    if not candidates:
+        return ""
+    sized = sorted((t for t in candidates if t.get("width")),
+                   key=lambda t: abs(int(t["width"]) - 320))
+    return str((sized[0] if sized else candidates[-1])["url"])
 
 
 def _flatten(entries: Iterable[Any], depth: int = 0) -> list[dict[str, Any]]:
@@ -232,6 +246,7 @@ def expand_playlist(
             playlist_title=playlist_title,
             playlist_url=playlist_url,
             playlist_index=int(entry.get("playlist_index") or position),
+            thumbnail=best_thumbnail(entry),
         ))
         if limit > 0 and len(entries) >= limit:
             break
@@ -412,7 +427,10 @@ class DownloadManager:
             item = head[0] if len(head) == 1 else info
             if item and item.get("title"):
                 job.title = str(item["title"])
-                self._emit({"type": "metadata", "job_id": job.job_id, "title": job.title})
+                if not job.thumbnail:
+                    job.thumbnail = best_thumbnail(item)
+                self._emit({"type": "metadata", "job_id": job.job_id, "title": job.title,
+                            "thumbnail": job.thumbnail})
             if len(head) > 1:
                 self._prepare_multi(job, ydl, config, info, head, target_dir)
             elif config.skip_existing and self._existing_output(ydl, item, config, target_dir):

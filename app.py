@@ -14,14 +14,17 @@ from queue import Empty, Queue
 from typing import Any
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QByteArray, QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtCore import QByteArray, QEvent, QModelIndex, QRect, QRectF, QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QAction, QBrush, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
+    QFontMetrics, QIcon, QPainter, QPainterPath, QPalette, QPen, QPixmap,
+)
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest, QSslSocket
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QDoubleSpinBox, QProgressDialog, QScrollArea, QSpinBox, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget,
-    QToolButton, QVBoxLayout, QWidget,
+    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QDoubleSpinBox, QProgressDialog, QScrollArea, QSpinBox, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from downloader import (
@@ -31,7 +34,10 @@ from downloader import (
 )
 import ffmpeg_setup
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
-from spotify import DEFAULT_MATCH_SOURCE, MATCH_SOURCES, SpotifyError, looks_like_spotify, spotify_tracks
+from spotify import (
+    DEFAULT_MATCH_SOURCE, MATCH_SOURCES, SEARCH_KINDS, SpotifyCredentials, SpotifyError,
+    looks_like_spotify, search_spotify, spotify_tracks,
+)
 
 
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -52,6 +58,9 @@ EVENTS_PER_TICK = 500
 # otherwise grow the file without limit, and every redraw with it.
 HISTORY_LIMIT = 2000
 
+# Marks a Search-tab source as Spotify rather than a yt-dlp search prefix.
+SPOTIFY_PREFIX = "spotify:"
+QUEUE_FILTERS = ("All", "Active", "Done", "Failed")
 TERMINAL = {"Completed", "Failed", "Cancelled", "Skipped"}
 RETRYABLE = {"Failed", "Cancelled"}
 STATUS_COLORS = {
@@ -66,6 +75,39 @@ STATUS_COLORS = {
 }
 TEXT = "#c9d1d9"
 MUTED = "#8b949e"
+BRIGHT = "#f0f6fc"
+# Card surfaces, kept beside the status colours they sit against.
+CARD_BG = "#161b22"
+CARD_HOVER = "#1b2129"
+CARD_SELECTED = "#1c2b3d"
+CARD_BORDER = "#2a3038"
+ART_BG = "#21262d"
+TRACK_BG = "#21262d"
+ACTION_BG = "#21262d"
+ACTION_HOVER = "#2d343d"
+
+# Hostname fragment -> what to call it on a card.
+SOURCE_NAMES: list[tuple[str, str]] = [
+    ("youtube.com", "YouTube"), ("youtu.be", "YouTube"), ("instagram.com", "Instagram"),
+    ("tiktok.com", "TikTok"), ("twitter.com", "X"), ("x.com", "X"), ("facebook.com", "Facebook"),
+    ("soundcloud.com", "SoundCloud"), ("vimeo.com", "Vimeo"), ("bilibili.com", "Bilibili"),
+    ("twitch.tv", "Twitch"), ("reddit.com", "Reddit"), ("dailymotion.com", "Dailymotion"),
+    ("spotify.com", "Spotify"),
+]
+
+
+def source_label(url: str) -> str:
+    """A short, friendly name for where a download comes from."""
+    if is_search_query(url):
+        prefix = url.split(":", 1)[0].lower()
+        return "SoundCloud match" if prefix.startswith("scsearch") else "YouTube match"
+    host = urlparse(url).netloc.lower()
+    if not host:
+        return "Link"
+    for fragment, name in SOURCE_NAMES:
+        if fragment in host:
+            return name
+    return host[4:] if host.startswith("www.") else host
 
 # Combo label -> DownloadConfig.audio_format ("" keeps the video pipeline).
 FORMAT_CHOICES: list[tuple[str, str]] = [
@@ -140,6 +182,15 @@ QPushButton#warn { background: #9e6a03; border-color: #bb8009; color: #ffffff; }
 QPushButton#warn:hover { background: #bb8009; }
 QPushButton#warn:disabled { background: #3a2c0a; border-color: #3a2c0a; color: #7a6540; }
 QPushButton#small { padding: 3px 10px; font-size: 9pt; font-weight: 500; }
+QPushButton#chip { background: transparent; color: #8b949e; border: 1px solid #30363d; border-radius: 13px; padding: 4px 14px; font-weight: 600; font-size: 9pt; }
+QPushButton#chip:hover { color: #c9d1d9; border-color: #8b949e; }
+QPushButton#chip:checked { background: #1f6feb; border-color: #58a6ff; color: #ffffff; }
+
+QFrame#panel { background: #1b2028; border: 1px solid #30363d; border-radius: 10px; }
+QFrame#panel QPlainTextEdit { background: #0d1117; }
+QListWidget#cards { background: transparent; border: none; outline: none; }
+QListWidget#cards::item { border: none; background: transparent; }
+QListWidget#cards::item:selected { background: transparent; }
 
 QTableWidget { background: #0d1117; alternate-background-color: #11161d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; gridline-color: #21262d; selection-background-color: #1c2b3d; selection-color: #f0f6fc; outline: none; }
 QTableWidget::item { padding: 4px 10px; border: none; }
@@ -300,15 +351,43 @@ class SearchWorker(QThread):
     finished_ok = Signal(int, list)
     failed = Signal(int, str)
 
-    def __init__(self, generation: int, query: str, prefix: str, limit: int, logger: logging.Logger) -> None:
+    def __init__(self, generation: int, query: str, prefix: str, limit: int,
+                 logger: logging.Logger, credentials: Any = None) -> None:
         super().__init__()
         self.generation, self.query, self.prefix, self.limit, self.logger = generation, query, prefix, limit, logger
+        self.credentials = credentials
 
     def run(self) -> None:
         try:
-            self.finished_ok.emit(self.generation, search_videos(self.query, self.prefix, self.limit, self.logger))
+            if self.prefix.startswith(SPOTIFY_PREFIX):
+                results = self._spotify(self.prefix[len(SPOTIFY_PREFIX):])
+            else:
+                results = search_videos(self.query, self.prefix, self.limit, self.logger)
+            self.finished_ok.emit(self.generation, results)
         except Exception as exc:
-            self.failed.emit(self.generation, str(exc).strip() or exc.__class__.__name__)
+            self.failed.emit(self.generation, clean_error(exc) or exc.__class__.__name__)
+
+    def _spotify(self, kind: str) -> list[SearchResult]:
+        """Spotify's own results, shaped like every other search result.
+
+        The URL kept is the Spotify page: queueing it goes through the same
+        expansion a pasted Spotify link does, so one album becomes its tracks.
+        """
+        found = search_spotify(self.query, self.credentials, kind, self.limit, self.logger)
+        results: list[SearchResult] = []
+        for item in found:
+            note = item.subtitle
+            if item.total_tracks:
+                note = f"{note}  ·  {item.total_tracks} tracks" if note else f"{item.total_tracks} tracks"
+            results.append(SearchResult(
+                title=item.name,
+                url=item.url,
+                site="Spotify",
+                uploader=note,
+                duration=item.duration_ms / 1000 if item.duration_ms else None,
+                thumbnail=item.artwork,
+            ))
+        return results
 
 
 class PlaylistWorker(QThread):
@@ -388,6 +467,216 @@ class FFmpegFetcher(QThread):
             self.succeeded.emit(str(path))
 
 
+class JobCardDelegate(QStyledItemDelegate):
+    """Draws a download as a card.
+
+    Every card is painted, not built: a queue of a few thousand videos would
+    otherwise mean tens of thousands of widgets, and only the handful on
+    screen are ever drawn this way.
+    """
+
+    HEIGHT = 92
+    PAD = 11
+    ART = QSize(104, 58)
+    ACTION = QSize(74, 25)
+    PILL = 20
+
+    def __init__(self, window: MainWindow) -> None:
+        super().__init__(window)
+        self.window = window
+        self._hovered = -1          # job id the pointer is over
+
+    # -------------------------------------------------------------- geometry
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        return QSize(0, self.HEIGHT)
+
+    def _job(self, index: QModelIndex) -> DownloadJob | None:
+        return self.window.jobs_by_id.get(index.data(Qt.ItemDataRole.UserRole))
+
+    def _art_rect(self, card: QRect) -> QRect:
+        return QRect(card.left() + self.PAD,
+                     card.top() + (card.height() - self.ART.height()) // 2,
+                     self.ART.width(), self.ART.height())
+
+    def _action_rect(self, card: QRect) -> QRect:
+        # Sits under the status pill, so both share one right-hand column.
+        return QRect(card.right() - self.PAD - self.ACTION.width(),
+                     card.top() + self.PAD + self.PILL + 8,
+                     self.ACTION.width(), self.ACTION.height())
+
+    @staticmethod
+    def _action_for(job: DownloadJob) -> str:
+        if job.status in RETRYABLE:
+            return "Retry"
+        if job.status in {"Completed", "Skipped"} and job.output_path:
+            return "Open"
+        return ""
+
+    # --------------------------------------------------------------- painting
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        job = self._job(index)
+        if job is None:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        card = option.rect.adjusted(4, 3, -4, -3)
+        hovered = job.job_id == self._hovered
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(card), 10, 10)
+        painter.fillPath(path, QBrush(QColor(CARD_SELECTED if selected
+                                             else CARD_HOVER if hovered else CARD_BG)))
+        painter.setPen(QPen(QColor(CARD_BORDER), 1))
+        painter.drawPath(path)
+        # A tint down the left edge carries the status at a glance.
+        accent = QColor(STATUS_COLORS.get(job.status, MUTED))
+        edge = QPainterPath()
+        edge.addRoundedRect(QRectF(card.left(), card.top() + 10, 3.0, card.height() - 20), 1.5, 1.5)
+        painter.fillPath(edge, QBrush(accent))
+
+        self._paint_art(painter, self._art_rect(card), job)
+
+        small = painter.font()
+        small.setPointSize(max(7, small.pointSize() - 1))
+        small_metrics = QFontMetrics(small)
+        action = self._action_for(job)
+        # The pill and the action share one right-hand column, so the text
+        # beside them is cut to the same width on every line.
+        pill_width = small_metrics.horizontalAdvance(job.status) + 18
+        column = max(pill_width, self.ACTION.width() if action else 0)
+        text_left = self._art_rect(card).right() + self.PAD
+        width = max(60, card.right() - self.PAD - column - 12 - text_left)
+        # Anchored from both edges rather than stacked downwards: the font a
+        # machine actually has decides these heights, and a taller one must
+        # not push a line out of the card.
+        title_font = painter.font()
+        title_font.setBold(True)
+        metrics = QFontMetrics(title_font)
+        line = small_metrics.height()
+        progress_top = card.bottom() - self.PAD - 5
+        meta_top = progress_top - 7 - line
+        title_top = card.top() + self.PAD
+
+        painter.setPen(QColor(BRIGHT))
+        painter.setFont(title_font)
+        painter.drawText(QRect(text_left, title_top, width, min(metrics.height(), meta_top - title_top)),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         metrics.elidedText(job.title or job.url, Qt.TextElideMode.ElideRight, width))
+
+        # Where it came from, then how it is going, on one line in two
+        # colours so a failure still stands out without its own row.
+        small.setBold(False)
+        painter.setFont(small)
+        source = self._subtitle(job) + "  ·  "
+        source_width = min(small_metrics.horizontalAdvance(source), width)
+        painter.setPen(QColor(MUTED))
+        painter.drawText(QRect(text_left, meta_top, source_width, line),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         small_metrics.elidedText(source, Qt.TextElideMode.ElideRight, source_width))
+        detail_width = width - source_width
+        if detail_width > 30:
+            painter.setPen(QColor(STATUS_COLORS["Failed"] if job.status == "Failed" else TEXT))
+            painter.drawText(QRect(text_left + source_width, meta_top, detail_width, line),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             small_metrics.elidedText(job_detail(job), Qt.TextElideMode.ElideRight, detail_width))
+
+        self._paint_progress(painter, QRect(text_left, progress_top, width, 5), job, accent)
+
+        self._paint_status(painter, card, job, accent, small_metrics, pill_width)
+        if action:
+            self._paint_action(painter, self._action_rect(card), action, hovered)
+        painter.restore()
+
+    def _subtitle(self, job: DownloadJob) -> str:
+        bits = []
+        if job.playlist_title:
+            bits.append(job.playlist_title)
+        if job.media_count > 1:
+            bits.append(f"{job.media_count} files")
+        bits.append(source_label(job.url))
+        return "  ·  ".join(bits)
+
+    def _paint_art(self, painter: QPainter, rect: QRect, job: DownloadJob) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(rect), 6, 6)
+        painter.fillPath(path, QBrush(QColor(ART_BG)))
+        pixmap = self.window.thumbnail_for(job)
+        if pixmap is not None and not pixmap.isNull():
+            painter.save()
+            painter.setClipPath(path)
+            painter.drawPixmap(rect, pixmap)
+            painter.restore()
+            return
+        # Nothing to show yet: the first letter stands in for the artwork.
+        painter.setPen(QColor(MUTED))
+        letter = painter.font()
+        letter.setPointSize(16)
+        letter.setBold(True)
+        painter.setFont(letter)
+        initial = (job.title or job.url).strip()
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter,
+                         initial[:1].upper() if initial else "?")
+
+    def _paint_progress(self, painter: QPainter, rect: QRect, job: DownloadJob, accent: QColor) -> None:
+        track = QPainterPath()
+        track.addRoundedRect(QRectF(rect), 2.5, 2.5)
+        painter.fillPath(track, QBrush(QColor(TRACK_BG)))
+        if job.status in {"Completed", "Skipped"}:
+            fraction = 1.0
+        elif job.status == "Downloading" and not job.total_bytes:
+            fraction = 0.0        # size unknown; the detail line carries it
+        else:
+            fraction = max(0.0, min(1.0, job.progress))
+        if fraction <= 0:
+            return
+        filled = QPainterPath()
+        filled.addRoundedRect(QRectF(rect.adjusted(0, 0, -int(rect.width() * (1 - fraction)), 0)), 2.5, 2.5)
+        painter.fillPath(filled, QBrush(accent))
+
+    def _paint_status(self, painter: QPainter, card: QRect, job: DownloadJob,
+                      accent: QColor, metrics: QFontMetrics, width: int) -> None:
+        text = job.status
+        # Tall enough for descenders in whatever font this machine has.
+        height = max(self.PILL, metrics.height() + 2)
+        rect = QRect(card.right() - self.PAD - width, card.top() + self.PAD, width, height)
+        pill = QPainterPath()
+        pill.addRoundedRect(QRectF(rect), 10, 10)
+        tint = QColor(accent)
+        tint.setAlpha(38)
+        painter.fillPath(pill, QBrush(tint))
+        painter.setPen(QColor(accent))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _paint_action(self, painter: QPainter, rect: QRect, text: str, hovered: bool) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(rect), 6, 6)
+        painter.fillPath(path, QBrush(QColor(ACTION_HOVER if hovered else ACTION_BG)))
+        painter.setPen(QPen(QColor(CARD_BORDER), 1))
+        painter.drawPath(path)
+        painter.setPen(QColor(BRIGHT if hovered else TEXT))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    # ----------------------------------------------------------- interaction
+    def editorEvent(self, event: QEvent, model: Any, option: QStyleOptionViewItem,
+                    index: QModelIndex) -> bool:
+        job = self._job(index)
+        if job is None:
+            return False
+        if event.type() == QEvent.Type.MouseMove:
+            if self._hovered != job.job_id:
+                self._hovered = job.job_id
+                self.window.jobs_list.viewport().update()
+            return False
+        if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            card = option.rect.adjusted(4, 3, -4, -3)
+            action = self._action_for(job)
+            if action and self._action_rect(card).contains(event.pos()):
+                self.window.card_action(job, action)
+                return True
+        return False
+
+
 class MainWindow(QMainWindow):
     JOB_COLS = ("#", "Video", "Progress", "Details", "Status", "")
     HIST_COLS = ("Time", "Title", "Status", "URL", "Output / Error")
@@ -406,7 +695,9 @@ class MainWindow(QMainWindow):
         self.events: Queue[dict[str, Any]] = Queue()
         self.manager = DownloadManager(self.events, self.logger)
         self.jobs: list[DownloadJob] = []
-        self.job_rows: dict[int, dict[str, Any]] = {}
+        self.jobs_by_id: dict[int, DownloadJob] = {}
+        self._card_rows: dict[int, int] = {}      # job id -> row in the card list
+        self.queue_filter = "All"
         self.settings = self._load_settings()
         self.history: list[dict[str, Any]] = self._load_history()
         self._history_index: dict[tuple[str, str], int] = {}
@@ -428,6 +719,9 @@ class MainWindow(QMainWindow):
         self._playlist_worker: PlaylistWorker | None = None
         self._net = QNetworkAccessManager(self)
         self._thumb_cache: dict[str, QPixmap] = {}
+        self._thumb_pending: set[str] = set()
+        self.spotify_creds = SpotifyCredentials(
+            self.settings.get("spotify_client_id", ""), self.settings.get("spotify_client_secret", ""))
 
         self._build_ui()
         self._build_tray()
@@ -438,6 +732,25 @@ class MainWindow(QMainWindow):
         self._reload_timer.setSingleShot(True)
         self._reload_timer.setInterval(400)
         self._reload_timer.timeout.connect(self._reload_links)
+
+        # A card that moves in or out of the current filter needs the list
+        # rebuilt; during a batch that can happen many times a second, so the
+        # rebuilds are coalesced rather than run per event.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(250)
+        self._refresh_timer.timeout.connect(self._render_jobs)
+        # Likewise for artwork arriving: repaint once, not once per image.
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(120)
+        self._thumb_timer.timeout.connect(lambda: self.jobs_list.viewport().update())
+        # The counts and chips do not need redrawing for every event a busy
+        # batch produces; a few times a second reads the same to a person.
+        self._summary_timer = QTimer(self)
+        self._summary_timer.setSingleShot(True)
+        self._summary_timer.setInterval(150)
+        self._summary_timer.timeout.connect(self._update_summary)
 
         # Saving history and redrawing its table wait for a run of finished
         # jobs to settle, so a long playlist does not do either per video.
@@ -523,28 +836,47 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        source = QGroupBox("Links  (one per line, or separated by commas or spaces)")
-        sl = QVBoxLayout(source)
+        # --- adding links: a compact bar that gets out of the way -----------
+        self.add_panel = QFrame()
+        self.add_panel.setObjectName("panel")
+        sl = QVBoxLayout(self.add_panel)
+        sl.setContentsMargins(12, 10, 12, 10)
         sl.setSpacing(8)
-        self.direct_edit = QPlainTextEdit()
-        self.direct_edit.setPlaceholderText("Paste video links here — https://…  https://…")
-        self.direct_edit.setMinimumHeight(110)
-        self.direct_edit.textChanged.connect(lambda: self._reload_timer.start())
-        sl.addWidget(self.direct_edit)
 
-        meta = QHBoxLayout()
-        self.count_label = QLabel("Videos found: 0")
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.add_toggle = QToolButton()
+        self.add_toggle.setText("Add links")
+        self.add_toggle.setCheckable(True)
+        self.add_toggle.setChecked(True)
+        self.add_toggle.setAutoRaise(True)
+        self.add_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.add_toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self.add_toggle.toggled.connect(self._toggle_add_panel)
+        head.addWidget(self.add_toggle)
+        self.count_label = QLabel("Nothing queued yet")
         self.count_label.setObjectName("muted")
-        meta.addWidget(self.count_label, 1)
+        head.addWidget(self.count_label, 1)
         self.file_toggle = QToolButton()
-        self.file_toggle.setText("Load from a file")
+        self.file_toggle.setText("From a file")
         self.file_toggle.setCheckable(True)
         self.file_toggle.setAutoRaise(True)
         self.file_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.file_toggle.setArrowType(Qt.ArrowType.RightArrow)
         self.file_toggle.toggled.connect(self._toggle_file_source)
-        meta.addWidget(self.file_toggle)
-        sl.addLayout(meta)
+        head.addWidget(self.file_toggle)
+        sl.addLayout(head)
+
+        self.add_body = QWidget()
+        body = QVBoxLayout(self.add_body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(8)
+        self.direct_edit = QPlainTextEdit()
+        self.direct_edit.setPlaceholderText(
+            "Paste links — a video, a playlist, a channel, an Instagram post, a Spotify album…")
+        self.direct_edit.setFixedHeight(76)
+        self.direct_edit.textChanged.connect(lambda: self._reload_timer.start())
+        body.addWidget(self.direct_edit)
 
         self.file_row = QWidget()
         grid = QGridLayout(self.file_row)
@@ -562,36 +894,61 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.links_clear_btn, 0, 2)
         grid.setColumnStretch(0, 1)
         self.file_row.setVisible(False)
-        sl.addWidget(self.file_row)
-        layout.addWidget(source)
+        body.addWidget(self.file_row)
+        sl.addWidget(self.add_body)
+        layout.addWidget(self.add_panel)
 
-        self.jobs_table = QTableWidget(0, len(self.JOB_COLS))
-        self.jobs_table.setHorizontalHeaderLabels(self.JOB_COLS)
-        self.jobs_table.verticalHeader().setVisible(False)
-        self.jobs_table.setAlternatingRowColors(True)
-        self.jobs_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.jobs_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.jobs_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.jobs_table.setShowGrid(False)
-        self.jobs_table.setWordWrap(False)
-        header = self.jobs_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(0, 44)
-        header.resizeSection(2, 170)
-        header.resizeSection(3, 390)
-        header.resizeSection(4, 110)
-        header.resizeSection(5, 84)
-        header.setStretchLastSection(False)
-        self.jobs_table.setTextElideMode(Qt.TextElideMode.ElideRight)
-        self.jobs_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.jobs_table.verticalHeader().setDefaultSectionSize(36)
-        layout.addWidget(self.jobs_table, 1)
+        # --- the queue: filters, overall progress, then the cards -----------
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.filter_buttons: dict[str, QPushButton] = {}
+        for name in QUEUE_FILTERS:
+            chip = QPushButton(name)
+            chip.setObjectName("chip")
+            chip.setCheckable(True)
+            chip.setChecked(name == "All")
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.clicked.connect(lambda _=False, n=name: self._set_filter(n))
+            self.filter_buttons[name] = chip
+            bar.addWidget(chip)
+        bar.addStretch(1)
+        self.clear_done_btn = QPushButton("Clear finished")
+        self.clear_done_btn.setObjectName("small")
+        self.clear_done_btn.setToolTip("Take everything that finished or was skipped out of the queue")
+        self.clear_done_btn.clicked.connect(self._clear_finished)
+        bar.addWidget(self.clear_done_btn)
+        layout.addLayout(bar)
+
+        self.batch_bar = QProgressBar()
+        self.batch_bar.setRange(0, 1000)
+        self.batch_bar.setTextVisible(False)
+        self.batch_bar.setFixedHeight(6)
+        layout.addWidget(self.batch_bar)
+
+        self.jobs_list = QListWidget()
+        self.jobs_list.setObjectName("cards")
+        self.jobs_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.jobs_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.jobs_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.jobs_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.jobs_list.setUniformItemSizes(True)      # lets the view skip measuring every row
+        self.jobs_list.setMouseTracking(True)
+        self.jobs_list.setSpacing(0)
+        self.card_delegate = JobCardDelegate(self)
+        self.jobs_list.setItemDelegate(self.card_delegate)
+        self.jobs_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.jobs_list.customContextMenuRequested.connect(self._job_menu)
+        self.jobs_list.itemDoubleClicked.connect(self._card_double_clicked)
+        self.empty_label = QLabel("Paste a link above to get started.")
+        self.empty_label.setObjectName("muted")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.empty_label)
+        layout.addWidget(self.jobs_list, 1)
         return page
+
+    def _toggle_add_panel(self, shown: bool) -> None:
+        self.add_body.setVisible(shown)
+        self.add_toggle.setArrowType(Qt.ArrowType.DownArrow if shown else Qt.ArrowType.RightArrow)
 
     def _build_search_tab(self) -> QWidget:
         page = QWidget()
@@ -608,6 +965,8 @@ class MainWindow(QMainWindow):
         self.search_site = QComboBox()
         for name, key in SEARCH_SITES:
             self.search_site.addItem(name, key)
+        for label, kind in SEARCH_KINDS:
+            self.search_site.addItem(f"Spotify {label.lower()}", SPOTIFY_PREFIX + kind)
         self.search_site.setMinimumWidth(140)
         self.search_limit = QSpinBox()
         self.search_limit.setRange(1, MAX_RESULTS)
@@ -681,7 +1040,8 @@ class MainWindow(QMainWindow):
         self.search_btn.setEnabled(False)
         self.search_btn.setText("Searching…")
         self.search_status.setText(f"Searching {self.search_site.currentText()} for “{query}”…")
-        worker = SearchWorker(self._search_generation, query, prefix, self.search_limit.value(), self.logger)
+        worker = SearchWorker(self._search_generation, query, prefix, self.search_limit.value(),
+                              self.logger, self.spotify_creds)
         worker.finished_ok.connect(self._search_finished)
         worker.failed.connect(self._search_failed)
         worker.finished.connect(worker.deleteLater)
@@ -1004,6 +1364,33 @@ class MainWindow(QMainWindow):
         sp.addWidget(self.spotify_source_label, 0, 2)
         sp.addWidget(self.spotify_source, 0, 3)
         sp.addWidget(self.spotify_hint, 1, 0, 1, 4)
+
+        self.spotify_id_edit = QLineEdit(self.settings.get("spotify_client_id", ""))
+        self.spotify_id_edit.setPlaceholderText("Client ID from your Spotify app")
+        self.spotify_id_edit.editingFinished.connect(self._spotify_creds_changed)
+        self.spotify_secret_edit = QLineEdit(self.settings.get("spotify_client_secret", ""))
+        self.spotify_secret_edit.setPlaceholderText("Client Secret")
+        self.spotify_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.spotify_secret_edit.editingFinished.connect(self._spotify_creds_changed)
+        sp.addWidget(QLabel("Client ID"), 2, 0)
+        sp.addWidget(self.spotify_id_edit, 2, 1, 1, 3)
+        sp.addWidget(QLabel("Client Secret"), 3, 0)
+        sp.addWidget(self.spotify_secret_edit, 3, 1, 1, 3)
+        creds_row = QHBoxLayout()
+        self.spotify_creds_status = QLabel()
+        self.spotify_creds_status.setObjectName("muted")
+        self.spotify_creds_status.setWordWrap(True)
+        creds_row.addWidget(self.spotify_creds_status, 1)
+        self.spotify_test_btn = QPushButton("Test")
+        self.spotify_test_btn.setToolTip("Ask Spotify for a token with these credentials")
+        self.spotify_test_btn.clicked.connect(self._test_spotify_creds)
+        creds_row.addWidget(self.spotify_test_btn)
+        dash_btn = QPushButton("Get credentials")
+        dash_btn.setToolTip("Open the Spotify developer dashboard")
+        dash_btn.clicked.connect(lambda: QDesktopServices.openUrl(
+            QUrl("https://developer.spotify.com/dashboard")))
+        creds_row.addWidget(dash_btn)
+        sp.addLayout(creds_row, 4, 0, 1, 4)
         sp.setColumnStretch(1, 1)
         layout.addWidget(spot)
 
@@ -1046,6 +1433,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         self._mode_changed()
         self._pacing_changed()
+        self._update_spotify_creds_status()
         self._spotify_changed()
         self._playlists_changed()
         return page
@@ -1130,7 +1518,8 @@ class MainWindow(QMainWindow):
                 playlists += 1
                 for entry in entries:
                     self._add_job(prior, entry.url, title=entry.title, playlist_title=entry.playlist_title,
-                                  playlist_url=entry.playlist_url, playlist_index=entry.playlist_index)
+                                  playlist_url=entry.playlist_url, playlist_index=entry.playlist_index,
+                                  thumbnail=entry.thumbnail)
             else:
                 self._add_job(prior, url)
         self.count_label.setText(self._count_text(len(self.jobs), playlists))
@@ -1159,77 +1548,52 @@ class MainWindow(QMainWindow):
             text += f"   ({expanded} link{'s' if expanded != 1 else ''} expanded)"
         return text
 
+    # --------------------------------------------------------------- queue
+    @staticmethod
+    def _passes_filter(job: DownloadJob, name: str) -> bool:
+        if name == "Active":
+            return job.status in {"Queued", "Downloading", "Waiting"}
+        if name == "Done":
+            return job.status in {"Completed", "Skipped"}
+        if name == "Failed":
+            return job.status in RETRYABLE
+        return True
+
     def _render_jobs(self) -> None:
-        table = self.jobs_table
-        table.setRowCount(0)
-        self.job_rows.clear()
-        table.setRowCount(len(self.jobs))
-        for row, job in enumerate(self.jobs):
-            idx = QTableWidgetItem(f"{job.job_id:02d}")
-            idx.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            idx.setForeground(QColor(MUTED))
-            table.setItem(row, 0, idx)
-            title = QTableWidgetItem(job.title or job.url)
-            title.setToolTip(f"{job.playlist_title}\n{job.url}" if job.playlist_title else job.url)
-            table.setItem(row, 1, title)
-            bar = QProgressBar()
-            bar.setRange(0, 1000)
-            bar.setTextVisible(False)
-            bar.setFixedHeight(8)
-            wrapper = QWidget()
-            wl = QHBoxLayout(wrapper)
-            wl.setContentsMargins(8, 0, 8, 0)
-            wl.addWidget(bar)
-            table.setCellWidget(row, 2, wrapper)
-            detail = QTableWidgetItem()
-            detail.setFont(MONO_FONT())
-            table.setItem(row, 3, detail)
-            status = QTableWidgetItem()
-            status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            table.setItem(row, 4, status)
-            # The Retry button is built only once a row can actually use it:
-            # a channel with thousands of videos would otherwise pay for
-            # thousands of hidden buttons before anything is downloaded.
-            self.job_rows[job.job_id] = {"row": row, "bar": bar, "retry": None, "title": title,
-                                         "detail": detail, "status": status}
-            self._sync_row(job)
+        """Rebuild the card list. One list item per job, all of them painted."""
+        self.jobs_by_id = {job.job_id: job for job in self.jobs}
+        self.jobs_list.setUpdatesEnabled(False)
+        self.jobs_list.clear()
+        self._card_rows.clear()
+        for job in self.jobs:
+            if not self._passes_filter(job, self.queue_filter):
+                continue
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, job.job_id)
+            item.setSizeHint(QSize(0, JobCardDelegate.HEIGHT))
+            self._card_rows[job.job_id] = self.jobs_list.count()
+            self.jobs_list.addItem(item)
+            if job.thumbnail:
+                self._want_thumbnail(job.thumbnail)
+        self.jobs_list.setUpdatesEnabled(True)
         self._update_summary()
 
-    def _retry_button(self, job: DownloadJob, row: int) -> QPushButton:
-        retry = QPushButton("Retry")
-        retry.setObjectName("small")
-        retry.setMinimumWidth(64)
-        retry.clicked.connect(lambda _=False, j=job: self._retry_jobs([j]))
-        holder = QWidget()
-        layout = QHBoxLayout(holder)
-        layout.setContentsMargins(4, 3, 6, 3)
-        layout.addWidget(retry)
-        self.jobs_table.setCellWidget(row, 5, holder)
-        return retry
-
     def _sync_row(self, job: DownloadJob) -> None:
-        w = self.job_rows.get(job.job_id)
-        if not w:
+        """Repaint one card, without touching the rest of the list."""
+        self.jobs_by_id[job.job_id] = job
+        if job.thumbnail:
+            self._want_thumbnail(job.thumbnail)
+        if not self._passes_filter(job, self.queue_filter):
+            # It no longer belongs in the view this filter shows.
+            if job.job_id in self._card_rows:
+                self._refresh_timer.start()
             return
-        w["title"].setText(job.title or job.url)
-        w["status"].setText(job.status)
-        w["status"].setForeground(QColor(STATUS_COLORS.get(job.status, TEXT)))
-        wants_retry = job.status in RETRYABLE and not self.manager.active
-        retry = w["retry"]
-        if retry is None and wants_retry:
-            retry = w["retry"] = self._retry_button(job, w["row"])
-        if retry is not None:
-            retry.setVisible(wants_retry)
-        text = job_detail(job)
-        w["detail"].setText(text)
-        w["detail"].setToolTip(text if job.status == "Failed" else "")
-        w["detail"].setForeground(QColor(STATUS_COLORS["Failed"] if job.status == "Failed" else MUTED if job.status != "Downloading" else TEXT))
-        bar: QProgressBar = w["bar"]
-        if job.status == "Downloading" and not job.total_bytes:
-            bar.setRange(0, 0)
-        else:
-            bar.setRange(0, 1000)
-            bar.setValue(1000 if job.status in {"Completed", "Skipped"} else int(job.progress * 1000))
+        row = self._card_rows.get(job.job_id)
+        if row is None:
+            self._refresh_timer.start()     # newly matches the filter
+            return
+        index = self.jobs_list.model().index(row, 0)
+        self.jobs_list.update(index)
 
     def _update_summary(self) -> None:
         # One pass: this runs on every status event, of which a long playlist
@@ -1238,11 +1602,161 @@ class MainWindow(QMainWindow):
         completed, downloading = tally["Completed"], tally["Downloading"]
         queued = tally["Queued"] + tally["Waiting"]
         failed, skipped = tally["Failed"], tally["Skipped"]
+        total = len(self.jobs)
+        done = completed + skipped + failed
         self.summary_label.setText(
-            f"{completed} / {len(self.jobs)} completed   •   {downloading} downloading   •   {queued} queued   •   {skipped} skipped   •   {failed} failed"
+            f"{completed} / {total} completed   •   {downloading} downloading   •   {queued} queued   •   {skipped} skipped   •   {failed} failed"
+            if total else "Nothing queued"
         )
+        counts = {"All": total, "Active": downloading + queued,
+                  "Done": completed + skipped, "Failed": failed}
+        for name, chip in self.filter_buttons.items():
+            chip.setText(f"{name}  {counts[name]}" if counts[name] else name)
+            chip.setChecked(name == self.queue_filter)
+        self.batch_bar.setVisible(bool(total))
+        self.batch_bar.setValue(int(done / total * 1000) if total else 0)
+        self.empty_label.setVisible(not self.jobs_list.count())
+        if not total:
+            self.empty_label.setText("Paste a link above to get started.")
+        elif not self.jobs_list.count():
+            self.empty_label.setText(f"Nothing here under “{self.queue_filter}”.")
+        self.clear_done_btn.setEnabled(bool(counts["Done"]) and not self.manager.active)
         retryable = bool(tally.keys() & RETRYABLE) and not self.manager.active
         self.retry_btn.setEnabled(retryable)
+
+    def _set_filter(self, name: str) -> None:
+        self.queue_filter = name
+        self._render_jobs()
+
+    def _clear_finished(self) -> None:
+        if self.manager.active:
+            return
+        keep = [job for job in self.jobs if job.status not in {"Completed", "Skipped"}]
+        if len(keep) == len(self.jobs):
+            return
+        # The links box is the source of truth for what is queued, so the
+        # finished entries have to leave it too or the next reload brings
+        # them straight back.
+        self._drop_from_sources({job.url for job in self.jobs if job not in keep})
+        self.jobs = keep
+        for position, job in enumerate(self.jobs, 1):
+            job.job_id = position
+        self._render_jobs()
+
+    def _drop_from_sources(self, gone: set[str]) -> None:
+        """Remove links from the box, and from the expansions they came from."""
+        kept_lines = [line for line in self.direct_edit.toPlainText().splitlines()
+                      if line.strip() not in gone]
+        for url, entries in list(self._expanded.items()):
+            remaining = [e for e in entries if e.url not in gone]
+            if not remaining:
+                self._expanded.pop(url, None)
+                kept_lines = [line for line in kept_lines if line.strip() != url]
+            else:
+                self._expanded[url] = remaining
+        self.direct_edit.blockSignals(True)
+        self.direct_edit.setPlainText("\n".join(kept_lines))
+        self.direct_edit.blockSignals(False)
+
+    def _remove_jobs(self, jobs: list[DownloadJob]) -> None:
+        if self.manager.active or not jobs:
+            return
+        gone = {job.url for job in jobs}
+        self._drop_from_sources(gone)
+        self.jobs = [job for job in self.jobs if job.url not in gone]
+        for position, job in enumerate(self.jobs, 1):
+            job.job_id = position
+        self._render_jobs()
+
+    def _selected_jobs(self) -> list[DownloadJob]:
+        picked = [self.jobs_by_id.get(item.data(Qt.ItemDataRole.UserRole))
+                  for item in self.jobs_list.selectedItems()]
+        return [job for job in picked if job is not None]
+
+    def card_action(self, job: DownloadJob, action: str) -> None:
+        """The button painted on a card was clicked."""
+        if action == "Retry":
+            self._retry_jobs([job])
+        elif action == "Open":
+            self._reveal(job.output_path)
+
+    def _card_double_clicked(self, item: QListWidgetItem) -> None:
+        job = self.jobs_by_id.get(item.data(Qt.ItemDataRole.UserRole))
+        if job is None:
+            return
+        if job.output_path:
+            self._reveal(job.output_path)
+        elif is_basic_url(job.url):
+            QDesktopServices.openUrl(QUrl(job.url))
+
+    def _reveal(self, path: str) -> None:
+        target = Path(path)
+        if not path or not target.exists():
+            QMessageBox.information(self, "Not found",
+                                    "That file is no longer where it was saved.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.parent)))
+
+    def _job_menu(self, point: Any) -> None:
+        item = self.jobs_list.itemAt(point)
+        if item is None:
+            return
+        job = self.jobs_by_id.get(item.data(Qt.ItemDataRole.UserRole))
+        if job is None:
+            return
+        selected = self._selected_jobs() or [job]
+        menu = QMenu(self)
+        if job.output_path:
+            menu.addAction("Open containing folder", lambda: self._reveal(job.output_path))
+        if is_basic_url(job.url):
+            menu.addAction("Open the source page", lambda: QDesktopServices.openUrl(QUrl(job.url)))
+        menu.addAction("Copy link", lambda: QApplication.clipboard().setText(job.url))
+        if job.error:
+            menu.addAction("Copy the error", lambda: QApplication.clipboard().setText(job.error))
+        retryable = [j for j in selected if j.status in RETRYABLE]
+        if retryable and not self.manager.active:
+            menu.addSeparator()
+            menu.addAction(f"Retry {len(retryable)} selected" if len(retryable) > 1 else "Retry",
+                           lambda: self._retry_jobs(retryable))
+        if not self.manager.active:
+            menu.addSeparator()
+            menu.addAction(f"Remove {len(selected)} from the queue" if len(selected) > 1
+                           else "Remove from the queue", lambda: self._remove_jobs(selected))
+        menu.exec(self.jobs_list.viewport().mapToGlobal(point))
+
+    # ----------------------------------------------------------- thumbnails
+    def thumbnail_for(self, job: DownloadJob) -> QPixmap | None:
+        return self._thumb_cache.get(job.thumbnail) if job.thumbnail else None
+
+    def _want_thumbnail(self, url: str) -> None:
+        """Fetch artwork once, then repaint whatever is on screen."""
+        if not url or url in self._thumb_cache or url in self._thumb_pending:
+            return
+        self._thumb_pending.add(url)
+        reply = self._net.get(QNetworkRequest(QUrl(url)))
+
+        def done() -> None:
+            try:
+                self._thumb_pending.discard(url)
+                if reply.error() != QNetworkReply.NetworkError.NoError:
+                    return
+                pixmap = QPixmap()
+                if not pixmap.loadFromData(reply.readAll()):
+                    return
+                self._thumb_cache[url] = self._crop(pixmap, JobCardDelegate.ART)
+                self._thumb_timer.start()
+            finally:
+                reply.deleteLater()
+
+        reply.finished.connect(done)
+
+    @staticmethod
+    def _crop(pixmap: QPixmap, size: QSize) -> QPixmap:
+        scaled = pixmap.scaled(size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                               Qt.TransformationMode.SmoothTransformation)
+        x = max(0, (scaled.width() - size.width()) // 2)
+        y = max(0, (scaled.height() - size.height()) // 2)
+        return scaled.copy(x, y, size.width(), size.height())
 
     # ------------------------------------------------------------- actions
     def _audio_format(self) -> str:
@@ -1385,6 +1899,43 @@ class MainWindow(QMainWindow):
         # bottom bar exists; the first real render comes right after.
         if hasattr(self, "retry_btn") and not self.manager.active:
             self._reload_links()
+
+    def _spotify_creds_changed(self) -> None:
+        """Rebuild the credentials when either field is edited."""
+        client_id = self.spotify_id_edit.text().strip()
+        secret = self.spotify_secret_edit.text().strip()
+        if not self.spotify_creds.matches(client_id, secret):
+            self.spotify_creds = SpotifyCredentials(client_id, secret)
+        self._update_spotify_creds_status()
+
+    def _update_spotify_creds_status(self, message: str = "", good: bool = False) -> None:
+        if message:
+            self.spotify_creds_status.setText(message)
+            self.spotify_creds_status.setStyleSheet(
+                f"color: {STATUS_COLORS['Completed'] if good else STATUS_COLORS['Failed']}")
+            return
+        ready = self.spotify_creds.configured
+        self.spotify_creds_status.setText(
+            "Searching Spotify is ready." if ready else
+            "Searching Spotify needs a free app from the dashboard; pasting Spotify links works without one."
+        )
+        self.spotify_creds_status.setStyleSheet(f"color: {MUTED}")
+        self.spotify_test_btn.setEnabled(ready)
+
+    def _test_spotify_creds(self) -> None:
+        self._spotify_creds_changed()
+        self.spotify_test_btn.setEnabled(False)
+        self.spotify_creds_status.setText("Asking Spotify…")
+        QApplication.processEvents()
+        try:
+            self.spotify_creds.token()
+        except SpotifyError as exc:
+            self._update_spotify_creds_status(str(exc), good=False)
+            self.logger.warning("Spotify credentials rejected: %s", exc)
+        else:
+            self._update_spotify_creds_status("Spotify accepted these credentials.", good=True)
+            self.logger.info("Spotify credentials accepted")
+        self.spotify_test_btn.setEnabled(self.spotify_creds.configured)
 
     def _pacing_changed(self, _value: Any = None) -> None:
         pause, retries = self.pause_spin.value(), self.throttle_retry_spin.value()
@@ -1566,6 +2117,9 @@ class MainWindow(QMainWindow):
             return
         if kind == "metadata":
             job.title = event["title"]
+            if event.get("thumbnail") and not job.thumbnail:
+                job.thumbnail = event["thumbnail"]
+                self._want_thumbnail(job.thumbnail)
         elif kind == "media_count":
             job.media_count = int(event.get("count") or 0)
         elif kind == "progress":
@@ -1577,7 +2131,7 @@ class MainWindow(QMainWindow):
             job.media_count = int(event.get("media_count") or 0)
             if job.status in TERMINAL:
                 self._record_history(job)
-            self._update_summary()
+            self._summary_timer.start()
         self._sync_row(job)
 
     # -------------------------------------------------------------- tools
@@ -1718,6 +2272,8 @@ class MainWindow(QMainWindow):
             "rate_limit_retries": self.throttle_retry_spin.value(),
             "spotify": self.spotify_check.isChecked(),
             "spotify_source": self.spotify_source.currentData() or DEFAULT_MATCH_SOURCE,
+            "spotify_client_id": self.spotify_id_edit.text().strip(),
+            "spotify_client_secret": self.spotify_secret_edit.text().strip(),
             "ffmpeg_path": self.ffmpeg_edit.text(),
             "search_limit": self.search_limit.value(),
         }

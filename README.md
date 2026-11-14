@@ -43,18 +43,33 @@ Install FFmpeg separately and put its `bin` directory on `PATH`, or use the
 FFmpeg path field in the application. The app warns if it cannot find FFmpeg;
 it does not exit just because FFmpeg is unavailable.
 
-## URL sources
+## The Downloads screen
 
-Pasting links into the **Links** box on the Downloads tab is the main route:
-it accepts URLs separated by newlines, commas, spaces, or any mixture, and
-re-reads as you type. Dragging text or URLs from a browser onto the window
-appends them there.
+**Add links** at the top is where everything starts: paste URLs separated by
+newlines, commas, spaces, or any mixture, and the queue re-reads as you type.
+Dragging text or URLs from a browser onto the window appends them there. The
+whole panel collapses with the arrow beside its title once you are watching
+downloads rather than adding them. **From a file** opens a row for picking a
+`.txt` file of links (dropping a `.txt` file onto the window fills it in). When
+both are in use the two sources are merged and de-duplicated with order
+preserved; malformed entries stay visible as `Invalid` and are skipped.
 
-**Load from a file** below that box expands a secondary row for picking a
-`.txt` file of links (dropping a `.txt` file onto the window fills it in and
-expands the row automatically). When both are in use the two sources are
-merged and de-duplicated with order preserved. Malformed entries remain
-visible as `Invalid` and are skipped.
+Below that, each download is a card: artwork, title, where it came from, how it
+is going, and a progress bar, with a coloured edge and a status pill so a
+glance down the list tells you what is happening. Cards are drawn rather than
+built from widgets, so a queue of a few thousand stays as quick as a queue of
+ten.
+
+| On a card | Does |
+|---|---|
+| **Retry** / **Open** | The button changes with the state: retry a failed download, or open the folder of a finished one. |
+| Double-click | Opens the file's folder, or the source page if it has not downloaded yet. |
+| Right-click | Open the folder or source page, copy the link or the error, retry, or remove from the queue — on the whole selection, not just one card. |
+
+**All / Active / Done / Failed** above the list filter it and carry live
+counts, and the bar under them is the batch's overall progress. **Clear
+finished** takes everything completed or skipped out of the queue, and out of
+the links box with it, so what is left is what still needs doing.
 
 ## Playlists and channels
 
@@ -122,6 +137,23 @@ show a thumbnail, title, uploader, duration, and view count. Tick the rows you
 want and press **Add selected to queue** (or double-click a single row) to
 append them to the direct links box; links already queued are skipped. Pasting
 a URL into the search field adds it directly.
+
+### Searching Spotify
+
+The same tab can search Spotify for **tracks**, **albums** or **playlists**.
+This one does need credentials: anonymous access to Spotify's search is
+refused, and the search page carries no results to read. A free app from
+[the Spotify dashboard](https://developer.spotify.com/dashboard) gives a Client
+ID and Secret, which go in the **Spotify** group in Settings — **Test** checks
+them against Spotify there and then. Nobody signs in and no personal data is
+touched; the credentials only identify the app making the query, and they are
+stored in `settings.json` beside the app's other settings.
+
+A Spotify result queues as its Spotify link, so it goes down exactly the path a
+pasted Spotify link does: an album or playlist expands into its tracks, and
+each track is matched on YouTube or SoundCloud. Searching Spotify is therefore
+a nicer way to find the album than hunting for its URL — the downloading is
+unchanged, and still never touches Spotify's own audio.
 
 ## System tray
 
