@@ -83,7 +83,19 @@ are looking at and show how many of each there are, and the thin bar underneath
 is the progress of the whole batch. **Clear finished** tidies away everything
 that completed, taking it out of the links box too.
 
-**Retry failed** at the bottom re-runs everything that failed in one go.
+**Retry failed** at the bottom re-runs everything that failed in one go, and
+tells you how many it will do. You do not have to wait for the batch to end —
+retried downloads simply join the ones already running.
+
+### Adding links while downloads are running
+
+You can keep pasting while a batch is going. New links are picked up and start
+downloading on their own, without stopping anything or needing another press of
+**Start** — the status line confirms what was added and how many are left to
+go.
+
+Taking a link out of the box removes it from the queue, unless it is already
+downloading, in which case it is left to finish.
 
 ---
 
@@ -225,6 +237,7 @@ to quit properly. If a batch is still running, it will ask before closing.
 | Audio formats are not working | FFmpeg is missing. In Settings, press **Download** next to the FFmpeg path. The installer version already has it. |
 | The wrong song downloaded from a Spotify link | It matched the wrong upload. Remove that card and paste the correct video link instead. |
 | A video downloads with no subtitles | It had none in the languages you asked for. Try adding more languages, or `all`. |
+| The app closed by itself | `crash.log` next to the app records what it was doing at the time. Attaching it to a bug report is the single most useful thing you can do. |
 | Something else | `download.log` next to the app records every download, with timestamps and errors. |
 
 ---

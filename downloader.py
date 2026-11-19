@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
@@ -261,8 +261,11 @@ class DownloadManager:
         self.logger = logger
         self.cancel_event = threading.Event()
         self._executor: Optional[ThreadPoolExecutor] = None
-        self._futures: list[Future[None]] = []
         self._lock = threading.Lock()
+        # Shares the lock, so "is the batch still running" and "how much work
+        # is outstanding" are always decided together.
+        self._idle = threading.Condition(self._lock)
+        self._pending = 0
         self._active = False
         # Being throttled is a fact about this connection, not about one video,
         # so the pause it earns applies to every worker.
@@ -294,28 +297,56 @@ class DownloadManager:
         self.cancel_event.clear()
         with self._cooldown_lock:
             self._cooldown_until = 0.0
+        max_workers = 1 if config.mode == "Sequential" else max(1, min(config.workers, 5))
         with self._lock:
             self._active = True
-        max_workers = 1 if config.mode == "Sequential" else max(1, min(config.workers, 5))
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yt-dlp")
-        self._futures = [self._executor.submit(self._download_one, job, config) for job in jobs]
+            self._pending = 0
+            self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yt-dlp")
+        self.submit(jobs, config)
         threading.Thread(target=self._wait_for_batch, daemon=True).start()
+
+    def submit(self, jobs: list[DownloadJob], config: DownloadConfig) -> bool:
+        """Hand more work to a batch that is already running.
+
+        Returns False when there is no batch to add to, so the caller can
+        start one instead. Links dropped in mid-batch arrive this way.
+        """
+        if not jobs:
+            return self.active
+        with self._lock:
+            if not self._active or self._executor is None:
+                return False
+            # Counted before submitting, so the waiter cannot see zero
+            # outstanding work in the gap and call the batch finished.
+            self._pending += len(jobs)
+            for job in jobs:
+                self._executor.submit(self._run_job, job, config)
+        return True
+
+    def _run_job(self, job: DownloadJob, config: DownloadConfig) -> None:
+        try:
+            self._download_one(job, config)
+        except Exception:  # Defensive: each job should report its own failure.
+            self.logger.exception("Unexpected worker failure on %s", job.url)
+        finally:
+            with self._lock:
+                self._pending -= 1
+                self._idle.notify_all()
 
     def cancel(self) -> None:
         self.cancel_event.set()
         self._emit({"type": "batch_status", "status": "Cancelling"})
 
     def _wait_for_batch(self) -> None:
-        for future in self._futures:
-            try:
-                future.result()
-            except Exception:  # Defensive: each job should report its own failure.
-                self.logger.exception("Unexpected worker failure")
-        if self._executor:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-        self._executor = None
         with self._lock:
+            while self._pending:
+                self._idle.wait(0.25)
+            # Closing the door and declaring the batch over happen together,
+            # so a submit either gets in first or is told to start a new one.
             self._active = False
+            executor, self._executor = self._executor, None
+        if executor:
+            executor.shutdown(wait=True, cancel_futures=True)
         self._emit({"type": "batch_complete"})
 
     def _start_cooldown(self, seconds: float) -> None:

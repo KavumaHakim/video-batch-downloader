@@ -25,3 +25,6 @@ dist/
 
 # Auto-downloaded FFmpeg
 ffmpeg/
+
+# Crash tracebacks written beside the app
+crash.log

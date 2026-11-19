@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import faulthandler
 import json
 import logging
 import re
@@ -44,10 +45,15 @@ APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).re
 SETTINGS_FILE = APP_DIR / "settings.json"
 LOG_FILE = APP_DIR / "download.log"
 HISTORY_FILE = APP_DIR / "download_history.json"
+CRASH_FILE = APP_DIR / "crash.log"
 ICON_ICO = BUNDLE_DIR / "assets" / "app_icon.ico"
 ICON_PNG = BUNDLE_DIR / "assets" / "app_icon.png"
 UI_ASSETS = BUNDLE_DIR / "assets" / "ui"
 
+# The window opens at most this big, and at most this much of the screen,
+# so it is tall for the queue without covering the whole display.
+WINDOW_SIZE = QSize(1280, 1000)
+WINDOW_FILL = 0.92
 HISTORY_TAB = 2
 # Most events a single poll may handle, so a busy batch cannot starve repaints.
 EVENTS_PER_TICK = 500
@@ -230,6 +236,42 @@ QToolTip { background: #161b22; color: #e6edf3; border: 1px solid #30363d; paddi
 QMessageBox, QDialog { background: #161b22; }
 QMessageBox QLabel { color: #e6edf3; }
 """
+
+
+_CRASH_HANDLE = None    # kept alive: faulthandler writes to it as the process dies
+
+
+def enable_crash_log() -> None:
+    """Leave a Python traceback behind when the process dies hard.
+
+    A crash inside the interpreter gives Windows nothing but an address, which
+    says nothing about what the app was doing. faulthandler writes the stack of
+    every thread into crash.log instead, which is the difference between a
+    report that can be acted on and one that cannot.
+    """
+    global _CRASH_HANDLE
+    try:
+        _CRASH_HANDLE = open(CRASH_FILE, "a", encoding="utf-8", buffering=1)
+        _CRASH_HANDLE.write(
+            f"\n===== started {datetime.datetime.now().isoformat(timespec='seconds')} =====\n")
+        faulthandler.enable(file=_CRASH_HANDLE, all_threads=True)
+    except OSError:
+        pass            # a read-only folder must not stop the app starting
+
+
+def log_thread_exceptions(logger: logging.Logger) -> None:
+    """Record exceptions that escape a thread or the event loop."""
+    def thread_hook(args: threading.ExceptHookArgs) -> None:
+        logger.error("Unhandled error in thread %s", getattr(args.thread, "name", "?"),
+                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+    threading.excepthook = thread_hook
+
+    previous = sys.excepthook
+
+    def hook(exc_type: Any, value: Any, tb: Any) -> None:
+        logger.error("Unhandled error", exc_info=(exc_type, value, tb))
+        previous(exc_type, value, tb)
+    sys.excepthook = hook
 
 
 def setup_logger() -> logging.Logger:
@@ -656,17 +698,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Video Batch Downloader")
         self.setWindowIcon(app_icon())
-        self.resize(1180, 820)
         self.setMinimumSize(900, 620)
+        self._placed = False
+        self._fit_to_screen()
         self.setAcceptDrops(True)
 
         self.logger = setup_logger()
+        log_thread_exceptions(self.logger)
         self.events: Queue[dict[str, Any]] = Queue()
         self.manager = DownloadManager(self.events, self.logger)
         self.jobs: list[DownloadJob] = []
         self.jobs_by_id: dict[int, DownloadJob] = {}
         self._card_rows: dict[int, int] = {}      # job id -> row in the card list
         self.queue_filter = "All"
+        self._next_job_id = 1          # ids never shift: a worker holds one per job
+        self._submitted: set[int] = set()
         self.settings = self._load_settings()
         self.history: list[dict[str, Any]] = self._load_history()
         self._history_index: dict[tuple[str, str], int] = {}
@@ -731,6 +777,42 @@ class MainWindow(QMainWindow):
         self._poll.setInterval(100)
         self._poll.timeout.connect(self._poll_events)
         self._poll.start()
+
+    def _fit_to_screen(self) -> None:
+        """Open nearly as tall as the screen allows, in the middle of it.
+
+        The queue is a long list, so height is worth having; availableGeometry
+        keeps the window clear of the taskbar, and the minimum size wins on a
+        small screen so nothing is ever cut off.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(WINDOW_SIZE)
+            return
+        area = screen.availableGeometry()
+        # The title bar and borders count towards what fills the screen, and
+        # they are only measurable once the window has been shown.
+        frame = self.frameGeometry()
+        extra_h = max(0, frame.height() - self.height())
+        extra_w = max(0, frame.width() - self.width())
+        height = max(self.minimumHeight(),
+                     min(WINDOW_SIZE.height(), int(area.height() * WINDOW_FILL) - extra_h))
+        width = max(self.minimumWidth(),
+                    min(WINDOW_SIZE.width(), int(area.width() * WINDOW_FILL) - extra_w))
+        self.resize(width, height)
+        frame = self.frameGeometry()
+        frame.moveCenter(area.center())
+        # Never let the title bar end up above the top of the screen, which
+        # would put it out of reach.
+        self.move(max(area.left(), frame.left()), max(area.top(), frame.top()))
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        # Now the frame has a real size, so the fit can account for it. Only
+        # the first time: after that the window is wherever the person put it.
+        if not self._placed:
+            self._placed = True
+            self._fit_to_screen()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -1444,7 +1526,12 @@ class MainWindow(QMainWindow):
         return merged
 
     def _reload_links(self) -> None:
-        if self.manager.active or self._playlist_worker is not None:
+        """Rebuild the queue from the links box, keeping what is already there.
+
+        This runs while downloads are in flight too: links dropped in mid-batch
+        join the queue and are handed to the running batch.
+        """
+        if self._playlist_worker is not None:
             return
         prior = {job.url: job for job in self.jobs}
         self.jobs = []
@@ -1459,24 +1546,57 @@ class MainWindow(QMainWindow):
                                   thumbnail=entry.thumbnail)
             else:
                 self._add_job(prior, url)
+        # A job being downloaded right now stays, even if its link was taken
+        # out of the box: a worker is still working on it.
+        if self.manager.active:
+            queued = {job.url for job in self.jobs}
+            self.jobs.extend(job for job in prior.values()
+                             if job.url not in queued
+                             and job.status in {"Downloading", "Waiting"})
         self.count_label.setText(self._count_text(len(self.jobs), playlists))
         self._render_jobs()
+        self._feed_running_batch()
 
     def _add_job(self, prior: dict[str, DownloadJob], url: str, title: str = "", **extra: Any) -> None:
-        """Append one job, carrying over the state of a job for the same URL."""
-        index = len(self.jobs) + 1
-        if not is_queueable(url):
-            self.jobs.append(DownloadJob(index, url, title=title, status="Invalid", **extra))
-            return
+        """Append one job, keeping the existing one for a URL already queued.
+
+        The same object is reused rather than copied: a worker thread may be
+        downloading it right now, and its job id is how its progress finds its
+        way back to the right card.
+        """
         old = prior.get(url)
-        if old:
-            self.jobs.append(DownloadJob(
-                index, url, title=old.title or title, status=old.status, progress=old.progress,
-                downloaded_bytes=old.downloaded_bytes, total_bytes=old.total_bytes,
-                output_path=old.output_path, error=old.error, note=old.note,
-                media_count=old.media_count, **extra))
-        else:
-            self.jobs.append(DownloadJob(index, url, title=title, **extra))
+        if old is not None:
+            for field, value in extra.items():
+                if value:                      # only fill blanks; never undo what a download learned
+                    setattr(old, field, value)
+            if title and not old.title:
+                old.title = title
+            self.jobs.append(old)
+            return
+        job_id = self._next_job_id
+        self._next_job_id += 1
+        status = "Queued" if is_queueable(url) else "Invalid"
+        self.jobs.append(DownloadJob(job_id, url, title=title, status=status, **extra))
+
+    def _feed_running_batch(self) -> None:
+        """Hand anything newly queued to a batch that is already downloading."""
+        if not self.manager.active:
+            return
+        # A playlist or Spotify link dropped in mid-batch has to be read before
+        # there is anything to add; the reload it finishes with lands back here.
+        if self._playlist_worker is None and self._playlist_candidates():
+            self._expand_playlists_then_start()
+            return
+        fresh = [job for job in self.jobs
+                 if job.status == "Queued" and is_queueable(job.url)
+                 and job.job_id not in self._submitted]
+        if not fresh:
+            return
+        if self.manager.submit(fresh, self._config()):
+            self._submitted.update(job.job_id for job in fresh)
+            self.logger.info("Added %d link(s) to the running batch", len(fresh))
+            self.status_label.setText(
+                f"Added {len(fresh)} to the batch — {self._active_count()} still to go")
 
     @staticmethod
     def _count_text(videos: int, expanded: int) -> str:
@@ -1558,8 +1678,13 @@ class MainWindow(QMainWindow):
         elif not self.jobs_list.count():
             self.empty_label.setText(f"Nothing here under “{self.queue_filter}”.")
         self.clear_done_btn.setEnabled(bool(counts["Done"]) and not self.manager.active)
-        retryable = bool(tally.keys() & RETRYABLE) and not self.manager.active
-        self.retry_btn.setEnabled(retryable)
+        self.retry_btn.setEnabled(bool(tally.keys() & RETRYABLE))
+        self.retry_btn.setText(f"Retry {failed} failed" if failed > 1 else "Retry failed")
+        # Start is only dead when there is genuinely nothing waiting.
+        self.start_btn.setEnabled(bool(queued) or not self.manager.active)
+
+    def _active_count(self) -> int:
+        return sum(job.status in {"Queued", "Downloading", "Waiting"} for job in self.jobs)
 
     def _set_filter(self, name: str) -> None:
         self.queue_filter = name
@@ -1576,8 +1701,6 @@ class MainWindow(QMainWindow):
         # them straight back.
         self._drop_from_sources({job.url for job in self.jobs if job not in keep})
         self.jobs = keep
-        for position, job in enumerate(self.jobs, 1):
-            job.job_id = position
         self._render_jobs()
 
     def _drop_from_sources(self, gone: set[str]) -> None:
@@ -1601,8 +1724,6 @@ class MainWindow(QMainWindow):
         gone = {job.url for job in jobs}
         self._drop_from_sources(gone)
         self.jobs = [job for job in self.jobs if job.url not in gone]
-        for position, job in enumerate(self.jobs, 1):
-            job.job_id = position
         self._render_jobs()
 
     def _selected_jobs(self) -> list[DownloadJob]:
@@ -1938,6 +2059,11 @@ class MainWindow(QMainWindow):
             stuck = next(((url, why) for url, why in problems if looks_like_spotify(url)), None)
             if stuck:
                 self.status_label.setText(f"Could not read that Spotify link — {stuck[1]}")
+        if self.manager.active:
+            # This was a link dropped into a batch that is already running:
+            # the reload above has already handed its videos over, and there
+            # is nothing to start.
+            return
         self._start_pending()
 
     def _retry_failed(self) -> None:
@@ -1945,12 +2071,13 @@ class MainWindow(QMainWindow):
 
     def _retry_jobs(self, jobs: list[DownloadJob]) -> None:
         jobs = [j for j in jobs if j.status in RETRYABLE and is_queueable(j.url)]
-        if not jobs or self.manager.active:
+        if not jobs:
             return
         for job in jobs:
             job.status, job.error, job.output_path = "Queued", "", ""
             job.note, job.media_count = "", 0
             job.progress, job.downloaded_bytes, job.total_bytes, job.speed, job.eta = 0.0, 0, None, None, None
+            self._submitted.discard(job.job_id)
             self._sync_row(job)
         self._update_summary()
         self._launch(jobs)
@@ -1959,17 +2086,28 @@ class MainWindow(QMainWindow):
         config = self._config()
         try:
             config.output_dir.mkdir(parents=True, exist_ok=True)
+            if self.manager.submit(jobs, config):
+                # A batch is already running, so these simply join it.
+                self._submitted.update(job.job_id for job in jobs)
+                self._update_summary()
+                for job in jobs:
+                    self._sync_row(job)
+                self.status_label.setText(
+                    f"Added {len(jobs)} to the batch — {self._active_count()} still to go")
+                return
+            self._submitted = {job.job_id for job in jobs}
             self.manager.start(jobs, config)
         except Exception as exc:
             QMessageBox.critical(self, "Unable to start", str(exc))
             return
         self._save_settings()
-        self.start_btn.setEnabled(False)
-        self.retry_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.status_label.setText(f"Downloading {len(jobs)} item{'s' if len(jobs) != 1 else ''}…")
         for job in self.jobs:
             self._sync_row(job)
+        # Keeps Start and Retry honest about what is still waiting; both stay
+        # usable during a batch, because anything they queue now joins it.
+        self._update_summary()
 
     def _cancel(self) -> None:
         if self._playlist_worker is not None:
@@ -1995,8 +2133,8 @@ class MainWindow(QMainWindow):
     def _handle_event(self, event: dict[str, Any]) -> None:
         kind = event["type"]
         if kind == "batch_complete":
-            self.start_btn.setEnabled(True)
             self.cancel_btn.setEnabled(False)
+            self._submitted.clear()
             self._write_history()
             failed = sum(j.status in RETRYABLE for j in self.jobs)
             completed = sum(j.status == "Completed" for j in self.jobs)
@@ -2012,8 +2150,8 @@ class MainWindow(QMainWindow):
         if kind == "batch_status":
             return
         job_id = event.get("job_id")
-        job = next((item for item in self.jobs if item.job_id == job_id), None)
-        if not job:
+        job = self.jobs_by_id.get(job_id)
+        if job is None:
             return
         if kind == "metadata":
             job.title = event["title"]
@@ -2435,6 +2573,7 @@ def apply_theme(app: QApplication) -> None:
 
 
 def main() -> None:
+    enable_crash_log()
     app = QApplication(sys.argv)
     app.setApplicationName("Video Batch Downloader")
     app.setWindowIcon(app_icon())
