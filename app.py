@@ -1414,6 +1414,19 @@ class MainWindow(QMainWindow):
         sp.setColumnStretch(1, 1)
         layout.addWidget(spot)
 
+        privacy = QGroupBox("Privacy")
+        pv = QVBoxLayout(privacy)
+        pv.setSpacing(6)
+        self.incognito_check = QCheckBox("Incognito — do not record downloads in History")
+        self.incognito_check.setChecked(bool(self.settings.get("incognito", False)))
+        self.incognito_check.toggled.connect(self._incognito_changed)
+        self.incognito_hint = QLabel()
+        self.incognito_hint.setObjectName("muted")
+        self.incognito_hint.setWordWrap(True)
+        pv.addWidget(self.incognito_check)
+        pv.addWidget(self.incognito_hint)
+        layout.addWidget(privacy)
+
         subs = QGroupBox("Subtitles")
         sg = QGridLayout(subs)
         sg.setHorizontalSpacing(12)
@@ -1452,6 +1465,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(note)
         layout.addStretch(1)
         self._mode_changed()
+        self._incognito_changed()
         self._pacing_changed()
         self._spotify_changed()
         self._playlists_changed()
@@ -1958,6 +1972,20 @@ class MainWindow(QMainWindow):
         if hasattr(self, "retry_btn") and not self.manager.active:
             self._reload_links()
 
+    def _incognito_changed(self, _checked: bool = False) -> None:
+        on = self.incognito_check.isChecked()
+        # Say plainly what it does and does not cover, rather than letting the
+        # word "incognito" promise more than it delivers.
+        self.incognito_hint.setText(
+            "Downloads are not added to History while this is on. What is already "
+            "in History stays until you clear it, and download.log still records "
+            "activity so problems can be looked into."
+            if on else
+            "Every finished download is listed in History, with where its file went."
+        )
+        if hasattr(self, "history_count"):
+            self._render_history()
+
     def _pacing_changed(self, _value: Any = None) -> None:
         pause, retries = self.pause_spin.value(), self.throttle_retry_spin.value()
         if pause > 0:
@@ -2318,6 +2346,7 @@ class MainWindow(QMainWindow):
             "rate_limit_retries": self.throttle_retry_spin.value(),
             "spotify": self.spotify_check.isChecked(),
             "spotify_source": self.spotify_source.currentData() or DEFAULT_MATCH_SOURCE,
+            "incognito": self.incognito_check.isChecked(),
             "ffmpeg_path": self.ffmpeg_edit.text(),
             "search_limit": self.search_limit.value(),
         }
@@ -2364,7 +2393,13 @@ class MainWindow(QMainWindow):
         if index == HISTORY_TAB and self._history_stale:
             self._render_history()
 
+    @property
+    def incognito(self) -> bool:
+        return bool(getattr(self, "incognito_check", None)) and self.incognito_check.isChecked()
+
     def _record_history(self, job: DownloadJob) -> None:
+        if self.incognito:
+            return
         entry = {
             "url": job.url,
             "title": job.title,
@@ -2388,6 +2423,8 @@ class MainWindow(QMainWindow):
         self._history_changed()
 
     def _write_history(self) -> None:
+        if self.incognito:
+            return
         for job in self.jobs:
             if job.status in TERMINAL:
                 self._record_history(job)
@@ -2434,7 +2471,12 @@ class MainWindow(QMainWindow):
                 table.setItem(row, col, item)
         table.setSortingEnabled(True)
         n = len(self.history)
-        self.history_count.setText(f"{n} entr{'y' if n == 1 else 'ies'}")
+        counted = f"{n} entr{'y' if n == 1 else 'ies'}"
+        self.history_count.setText(
+            f"{counted}  —  incognito is on, so new downloads are not being added"
+            if self.incognito else counted)
+        self.history_count.setStyleSheet(
+            f"color: {STATUS_COLORS['Cancelled']}" if self.incognito else f"color: {MUTED}")
 
     def _open_history_row(self, row: int, _col: int) -> None:
         item = self.history_table.item(row, 0)

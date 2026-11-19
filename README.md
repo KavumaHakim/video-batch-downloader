@@ -212,6 +212,7 @@ If it keeps happening, lower **Workers**, raise the pause, or come back later.
 | **Mode / Workers** | Sequential does one at a time; Parallel does up to five at once. |
 | **Skip files that already exist** | Leaves alone anything already in the output folder, so a re-run picks up where it left off. |
 | **FFmpeg path** | Only needed if you want your own FFmpeg instead of the included one. |
+| **Incognito** | Stops downloads being recorded in History. |
 
 Settings are saved when a download starts and when you close the app.
 
@@ -221,6 +222,13 @@ Settings are saved when a download starts and when you close the app.
 
 The **History** tab lists everything downloaded, with the time, title, status
 and where it went. Double-click a row to open its folder. **Clear** empties it.
+
+If you would rather it kept no list, tick **Incognito** under **Privacy** in
+Settings. While it is on, finished downloads are not added to History and
+nothing is written to the history file — the History tab says so at the top, so
+you are never left wondering why it is not filling up. Anything already in
+History stays until you clear it, and `download.log` still records activity so
+problems can be looked into.
 
 Closing the window keeps the app running in the system tray so downloads carry
 on. Click the tray icon to bring it back, or right-click it and choose **Exit**
