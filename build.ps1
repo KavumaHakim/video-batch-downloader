@@ -30,6 +30,23 @@ Write-Host ("Built {0} ({1} MB)" -f $exe, [math]::Round((Get-Item $exe).Length /
 
 if (-not $Installer) { return }
 
+# The installer carries FFmpeg, so it has to be here before Inno Setup runs.
+# Fetching it is the same verified download the app itself offers.
+$needed = @("ffmpeg\ffmpeg.exe", "ffmpeg\ffprobe.exe", "ffmpeg\LICENSE.txt")
+$missing = $needed | Where-Object { -not (Test-Path (Join-Path $PSScriptRoot $_)) }
+if ($missing) {
+    Write-Host ("Fetching FFmpeg for the installer (missing: " + ($missing -join ", ") + ")") -ForegroundColor Cyan
+    Invoke-Step "uv" @("run", "python", "-c", @"
+import ffmpeg_setup
+print('FFmpeg ready at', ffmpeg_setup.download_ffmpeg())
+"@) "FFmpeg download"
+    $still = $needed | Where-Object { -not (Test-Path (Join-Path $PSScriptRoot $_)) }
+    if ($still) {
+        Write-Host ("FFmpeg is still incomplete: " + ($still -join ", ")) -ForegroundColor Red
+        exit 1
+    }
+}
+
 $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
 if (-not $iscc) {
     $iscc = @(

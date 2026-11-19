@@ -1,0 +1,42 @@
+FFmpeg bundled with Video Batch Downloader
+==========================================
+
+This application ships with FFmpeg so that audio conversion, stream merging
+and subtitle handling work without a separate download. FFmpeg is a separate
+program, written by the FFmpeg developers, not by this project. The app runs
+it as an external process; no FFmpeg code is linked into the application.
+
+What is included
+----------------
+ffmpeg.exe and ffprobe.exe from the "release-essentials" Windows build
+published by Gyan Doshi at https://www.gyan.dev/ffmpeg/builds/, which is the
+Windows build linked from the official https://ffmpeg.org/download.html page.
+
+These binaries are configured with --enable-gpl --enable-version3 and are
+therefore covered by the GNU General Public License, version 3 or later.
+The full licence text is in LICENSE.txt beside this file, and the build's own
+notes, including the exact component licences, are in README.txt.
+
+Getting the source
+------------------
+The complete corresponding source for these binaries is available, free of
+charge, from the same place the binaries come from:
+
+  https://www.gyan.dev/ffmpeg/builds/        (source archives are linked there)
+  https://ffmpeg.org/download.html           (upstream releases)
+  https://git.ffmpeg.org/ffmpeg.git          (upstream source repository)
+
+If you would rather receive the source from us, open an issue at
+https://github.com/KavumaHakim/video-batch-downloader/issues and we will
+provide it.
+
+Your rights
+-----------
+The GPL gives you the right to use, study, share and modify FFmpeg. Nothing
+about bundling it here limits those rights. You may delete the ffmpeg folder
+and point the app at your own FFmpeg build instead: Settings has an FFmpeg
+path field for exactly that, and the app will use whatever you put there in
+preference to the bundled copy.
+
+Video Batch Downloader itself is a separate work that merely invokes FFmpeg,
+and is distributed under its own licence.

@@ -26,6 +26,9 @@ VERSION_URL = BASE_URL + "release-version"
 USER_AGENT = "video-batch-downloader"
 
 WANTED = ("ffmpeg.exe", "ffprobe.exe")
+# Kept beside the binaries so a bundled copy can legally be passed on:
+# these builds are configured --enable-gpl --enable-version3.
+LICENCE_MEMBERS = {"license": "LICENSE.txt", "license.txt": "LICENSE.txt", "readme.txt": "README.txt"}
 CHUNK = 256 * 1024
 READ_TIMEOUT = 120
 MAX_ATTEMPTS = 4
@@ -121,14 +124,22 @@ def _extract(archive: Path, destination: Path, cancel: Optional[threading.Event]
         for member in zf.infolist():
             if cancel is not None and cancel.is_set():
                 raise DownloadCancelled()
-            name = Path(member.filename).name
-            if member.is_dir() or name.lower() not in WANTED:
+            if member.is_dir():
+                continue
+            parts = Path(member.filename).parts
+            name = parts[-1].lower()
+            if name in WANTED:
+                out_name = name
+            elif name in LICENCE_MEMBERS and len(parts) == 2:
+                # Only the ones at the archive root; doc/ repeats these names.
+                out_name = LICENCE_MEMBERS[name]
+            else:
                 continue
             # Flatten to a known filename rather than trusting the archive's paths.
-            out = destination / name.lower()
+            out = destination / out_name
             with zf.open(member) as src, out.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
-            found[name.lower()] = out
+            found[out_name] = out
     if "ffmpeg.exe" not in found:
         raise RuntimeError("The downloaded archive did not contain ffmpeg.exe.")
     return found["ffmpeg.exe"]

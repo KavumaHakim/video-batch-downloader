@@ -3,7 +3,7 @@
 ; Requires dist\VideoBatchDownloader.exe to exist first.
 
 #define AppName "Video Batch Downloader"
-#define AppVersion "0.6.0"
+#define AppVersion "0.7.0"
 #define AppPublisher "KavumaHakim"
 #define AppURL "https://github.com/KavumaHakim/video-batch-downloader"
 #define AppExe "VideoBatchDownloader.exe"
@@ -47,6 +47,15 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
+; FFmpeg travels with the app, so audio formats, stream merging and subtitles
+; work without a download. This is the folder the app looks in. Its licence
+; and the offer of source sit beside it: these builds are GPL v3, and the app
+; only runs them as a separate process.
+Source: "ffmpeg\ffmpeg.exe"; DestDir: "{app}\ffmpeg"; Flags: ignoreversion
+Source: "ffmpeg\ffprobe.exe"; DestDir: "{app}\ffmpeg"; Flags: ignoreversion
+Source: "ffmpeg\LICENSE.txt"; DestDir: "{app}\ffmpeg"; Flags: ignoreversion
+Source: "ffmpeg\README.txt"; DestDir: "{app}\ffmpeg"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "FFMPEG-NOTICE.txt"; DestDir: "{app}\ffmpeg"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

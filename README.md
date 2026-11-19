@@ -185,16 +185,41 @@ Remaining time is shown as `Ns` under a minute, `M:SS` under an hour, and
 ## FFmpeg
 
 FFmpeg is needed to merge separate video/audio streams and for every audio
-format. Settings shows where it resolved to, and **Download** there fetches a
-static build into an `ffmpeg` folder beside the app — no install or admin
-rights required. Starting an audio batch without FFmpeg offers the same
-download.
+format.
 
-The archive comes from gyan.dev (the Windows build provider linked from
-ffmpeg.org) over HTTPS and is checked against the SHA-256 published alongside
-it; a mismatch is discarded rather than used. The transfer resumes if the
-connection drops and can be cancelled. A copy already on `PATH`, or one set
-explicitly in Settings, always takes precedence.
+**The installer brings FFmpeg with it.** It is placed in an `ffmpeg` folder
+beside the application, which is where the app looks, so an installed copy
+converts audio, merges streams and handles subtitles straight away, offline,
+with nothing to fetch. Settings says `Using the bundled FFmpeg` when that is
+the copy in play. This is why the installer is around 130 MB.
+
+The portable `VideoBatchDownloader.exe` is a single file and stays lean, so it
+has no FFmpeg inside it. Run it and press **Download** in Settings — or just
+start an audio batch, which offers the same download — and it fetches a build
+into an `ffmpeg` folder beside itself, once.
+
+Whatever the source, FFmpeg is resolved in this order: the path set explicitly
+in Settings, then the `ffmpeg` folder beside the app, then `PATH`. So you can
+always override the bundled copy with your own build.
+
+Downloads come from gyan.dev (the Windows build provider linked from
+ffmpeg.org) over HTTPS and are checked against the SHA-256 published alongside
+the archive; a mismatch is discarded rather than used. The transfer resumes if
+the connection drops and can be cancelled.
+
+### FFmpeg licensing
+
+The bundled binaries are the gyan.dev `release-essentials` build, configured
+`--enable-gpl --enable-version3`, so they are covered by the **GNU General
+Public License version 3**. Redistributing them carries obligations, which the
+installer meets: `ffmpeg\LICENSE.txt` is the licence itself, and
+`ffmpeg\FFMPEG-NOTICE.txt` records what is included and where to get the
+complete corresponding source, free of charge.
+
+FFmpeg is a separate program that the app runs as an external process; no
+FFmpeg code is linked into the application, so Video Batch Downloader remains
+under its own licence. Deleting the `ffmpeg` folder and pointing Settings at
+your own build is explicitly supported.
 
 ## Audio downloads (MP3 and friends)
 

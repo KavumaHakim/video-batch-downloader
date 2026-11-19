@@ -2153,7 +2153,12 @@ class MainWindow(QMainWindow):
             return
         ffmpeg = find_ffmpeg(self.ffmpeg_edit.text().strip())
         if ffmpeg:
-            self.ffmpeg_status.setText(f"Using {ffmpeg}")
+            # Say when it is the copy that came with the app, so nobody goes
+            # looking for a download they do not need.
+            bundled = ffmpeg_setup.installed_ffmpeg()
+            where = "Using the bundled FFmpeg" if bundled and Path(ffmpeg) == Path(bundled) \
+                else f"Using {ffmpeg}"
+            self.ffmpeg_status.setText(f"{where}  —  {ffmpeg}" if "bundled" in where else where)
             self.ffmpeg_status.setToolTip(ffmpeg)
             self.ffmpeg_status.setStyleSheet(f"color: {STATUS_COLORS['Completed']}")
         else:
@@ -2164,6 +2169,9 @@ class MainWindow(QMainWindow):
             self.ffmpeg_status.setStyleSheet(f"color: {STATUS_COLORS['Cancelled']}")
         if hasattr(self, "ffmpeg_get_btn"):
             self.ffmpeg_get_btn.setText("Download" if not ffmpeg else "Re-download")
+            self.ffmpeg_get_btn.setToolTip(
+                "Replace the bundled FFmpeg with the latest build from gyan.dev" if ffmpeg
+                else "Fetch a static FFmpeg build from gyan.dev into the app folder")
 
     def _browse_output(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose output folder", self.output_edit.text())
