@@ -1,338 +1,241 @@
 # Video Batch Downloader
 
-A focused desktop app for downloading batches of videos supported by
-yt-dlp. The interface is built with PySide6 (Qt) and keeps all downloads off
-the GUI thread, with per-video progress, retries, cancellation, playlist and
-channel expansion, multi-media posts, Spotify track matching, persistent
-history, system-tray support, and settings persistence.
+A Windows app for downloading a lot of videos at once. Paste links, press
+**Start download**, and watch them come down one card at a time. It handles
+playlists, whole channels, Instagram posts with several clips, and Spotify
+links, and it can save audio instead of video.
 
-## Requirements
+---
 
-- Python 3.10 or newer
-- FFmpeg recommended (required when yt-dlp needs to merge separate video and
-  audio streams)
-- A network connection and a text file containing URLs
+## Installing
 
-## Windows installation
+Grab the latest from the [releases page](https://github.com/KavumaHakim/video-batch-downloader/releases).
+Two downloads, same app:
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if it is
-not already available. In PowerShell, the official installer is:
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-Open PowerShell in this folder:
-
-```powershell
-uv sync
-uv run python app.py
-```
-
-`uv sync` creates and manages the project virtual environment automatically.
-For environments that do not use uv, the compatible pip setup remains:
-
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python app.py
-```
-
-Install FFmpeg separately and put its `bin` directory on `PATH`, or use the
-FFmpeg path field in the application. The app warns if it cannot find FFmpeg;
-it does not exit just because FFmpeg is unavailable.
-
-## The Downloads screen
-
-**Add links** at the top is where everything starts: paste URLs separated by
-newlines, commas, spaces, or any mixture, and the queue re-reads as you type.
-Dragging text or URLs from a browser onto the window appends them there. The
-whole panel collapses with the arrow beside its title once you are watching
-downloads rather than adding them. **From a file** opens a row for picking a
-`.txt` file of links (dropping a `.txt` file onto the window fills it in). When
-both are in use the two sources are merged and de-duplicated with order
-preserved; malformed entries stay visible as `Invalid` and are skipped.
-
-Below that, each download is a card: artwork, title, where it came from, how it
-is going, and a progress bar, with a coloured edge and a status pill so a
-glance down the list tells you what is happening. Cards are drawn rather than
-built from widgets, so a queue of a few thousand stays as quick as a queue of
-ten.
-
-| On a card | Does |
+| Download | Pick this if |
 |---|---|
-| **Retry** / **Open** | The button changes with the state: retry a failed download, or open the folder of a finished one. |
-| Double-click | Opens the file's folder, or the source page if it has not downloaded yet. |
-| Right-click | Open the folder or source page, copy the link or the error, retry, or remove from the queue — on the whole selection, not just one card. |
+| **VideoBatchDownloader-&lt;version&gt;-setup.exe** | You want it installed properly — Start Menu entry, optional desktop icon, an uninstaller, and FFmpeg already included so everything works offline. |
+| **VideoBatchDownloader.exe** | You want it portable — one file, no install, runs from a USB stick. It fetches FFmpeg itself the first time it needs it. |
 
-**All / Active / Done / Failed** above the list filter it and carry live
-counts, and the bar under them is the batch's overall progress. **Clear
-finished** takes everything completed or skipped out of the queue, and out of
-the links box with it, so what is left is what still needs doing.
+The installer needs no administrator rights. It installs to your own user
+folder, upgrades an older version in place, and keeps your settings, history
+and log.
 
-## Playlists and channels
+Windows may warn that the app is from an unknown publisher, because the build
+is not code-signed. Choose **More info → Run anyway** if you are happy to.
 
-Settings has a **Playlists and channels** group, on by default. With it on, a
-link to a playlist, channel, album, or set is read once when you press **Start
-download** and queued as the individual videos behind it, each with its own
-row, progress bar, status, and Retry button. Titles come from that single
-listing request, so a long playlist resolves in seconds rather than one request
-per video.
+---
 
-**Videos per playlist** caps how many videos one link contributes — useful
-against a channel with thousands of uploads — and `All` (0) takes every one.
-Changing the cap re-reads the links on the next Start. **Save each playlist in
-its own subfolder** puts the videos under a folder named after the playlist
-inside the output folder, with characters Windows rejects replaced.
+## Downloading something
 
-What was read is remembered for the session, so a second **Start** does not go
-back to the network, and the count under the Links box reports how many links
-expanded. A link that cannot be read as a playlist — a YouTube mix, a private
-list — is not an error: it falls back to downloading the single video it points
-at. With the option off, a playlist link brings down only that one video.
+1. Open the **Downloads** tab.
+2. Paste one or more links into **Add links**. Separate them with new lines,
+   commas or spaces — any mixture works. You can also drag links straight from
+   your browser onto the window.
+3. Press **Start download**.
 
-## Posts with several photos or clips
+That is the whole thing. Files land in your output folder, which starts as
+`Video Batch Downloader` inside your Videos folder and can be changed in
+Settings.
 
-An Instagram carousel is one post holding up to twenty photos and clips. It is
-not a playlist — every item lives at the same address and carries the same
-title — so it stays a single row in the queue and writes one file per item,
-named `<title> - <n> [<id>].<ext>` so the items neither overwrite each other nor
-collide with another post from the same account. The row then reads
-`Done • 3 files`. The same applies to any other site that serves one link as
-several media.
+### What you can paste
 
-This follows the **Playlists and channels** switch: with it off, one link means
-one file and only the first item of such a post is fetched. Audio-only formats
-do not mix with these posts — a photo has no soundtrack to extract, and the job
-fails on it — so download carousels as video.
+| Paste this | You get |
+|---|---|
+| A video link | That video. |
+| A playlist, channel or album link | Every video behind it, each queued separately. |
+| An Instagram post with several photos or clips | All of its items, as separate files. |
+| A Spotify track, album or playlist link | Each track, found on YouTube or SoundCloud. |
+| A `.txt` file of links | Everything in it — use **From a file**, or drop the file on the window. |
 
-## Spotify links
+Anything that is not a usable link stays in the list marked `Invalid` and is
+skipped rather than stopping the batch.
 
-Spotify's own streams are copy-protected and yt-dlp lists `open.spotify.com`
-among the sites it cannot download; nothing here changes that, and nothing is
-taken from Spotify itself. What the **Spotify** group in Settings does, when on,
-is read a `track`, `album`, `playlist` or `artist` link for *what is on it* —
-through the public embed page, which needs no account or API key — and queue
-each track as the closest match on **YouTube** or **SoundCloud**, your choice
-under **Find tracks on**.
+---
 
-Each track becomes its own row, showing `Artist — Title` from Spotify until the
-matched video's real title arrives. An album or playlist goes into a subfolder
-named after it, under the same **Save each playlist in its own subfolder**
-setting; a single track link does not. **Videos per playlist** caps a long
-playlist the same way it caps a YouTube one. Matching is a search, so a track
-with an ambiguous name can match the wrong upload — the row shows what was
-actually downloaded. Pick an audio format in the **Format** box to end up with
-files rather than videos.
+## The download list
 
-With the group switched off, a Spotify link is left alone and fails as an
-unsupported URL.
+Each download is a card showing its artwork, title, where it came from, how it
+is going, and a progress bar. The coloured edge and the label on the right tell
+you its state at a glance.
 
-## Searching for videos
+| State | Means |
+|---|---|
+| **Queued** | Waiting its turn. |
+| **Downloading** | In progress — the card shows size, speed and time left. |
+| **Waiting** | Holding off because the site is rate limiting. It will carry on by itself. |
+| **Completed** | Done. |
+| **Skipped** | The file was already in your output folder. |
+| **Failed** | Something went wrong — the reason is on the card. |
 
-The **Search** tab searches YouTube, SoundCloud, Bilibili, Niconico, or Yahoo
-Video through yt-dlp's search extractors, so no API keys are needed. Results
-show a thumbnail, title, uploader, duration, and view count. Tick the rows you
-want and press **Add selected to queue** (or double-click a single row) to
-append them to the direct links box; links already queued are skipped. Pasting
-a URL into the search field adds it directly.
+**Things you can do to a card**
 
-### Searching Spotify
+- The button on the right changes with the state: **Retry** a failed download,
+  or **Open** the folder of a finished one.
+- **Double-click** a card to open its folder, or the original page if it has
+  not downloaded yet.
+- **Right-click** for everything else: open the folder or the source page, copy
+  the link or the error, retry, or remove it from the queue. Select several
+  cards first and it applies to all of them.
 
-The same tab can search Spotify for **tracks**, **albums** or **playlists**.
-This one does need credentials: anonymous access to Spotify's search is
-refused, and the search page carries no results to read. A free app from
-[the Spotify dashboard](https://developer.spotify.com/dashboard) gives a Client
-ID and Secret, which go in the **Spotify** group in Settings — **Test** checks
-them against Spotify there and then. Nobody signs in and no personal data is
-touched; the credentials only identify the app making the query, and they are
-stored in `settings.json` beside the app's other settings.
+**Above the list**, the **All / Active / Done / Failed** buttons filter what you
+are looking at and show how many of each there are, and the thin bar underneath
+is the progress of the whole batch. **Clear finished** tidies away everything
+that completed, taking it out of the links box too.
 
-A Spotify result queues as its Spotify link, so it goes down exactly the path a
-pasted Spotify link does: an album or playlist expands into its tracks, and
-each track is matched on YouTube or SoundCloud. Searching Spotify is therefore
-a nicer way to find the album than hunting for its URL — the downloading is
-unchanged, and still never touches Spotify's own audio.
+**Retry failed** at the bottom re-runs everything that failed in one go.
 
-## System tray
+---
 
-Closing the window minimises the app to the system tray. Click the tray icon
-or choose **Show** from its menu to restore the window; choose **Exit** to
-quit fully. If a batch finishes while the window is hidden, a tray
-notification reports the result. Any active batch is cancelled cleanly on
-Exit and the history is flushed to disk.
+## Choosing video or audio
 
-## Download history
+The **Format** box at the bottom of the window decides what you end up with.
 
-`download_history.json` is persistent across sessions. Each finished job
-(Completed, Failed, Cancelled, or Skipped) is written with its original URL,
-title, status, output path, error, byte counts, and a timestamp, updated as
-each job finishes and again on exit. The History tab is sortable by any
-column; double-click a row to open the file's folder.
+- **Video (MP4)** — the normal choice. Use **Quality** in Settings to cap the
+  resolution; it is a maximum, so a lower-quality source is not stretched to
+  match.
+- **Audio: MP3, M4A, Opus, FLAC or WAV** — the soundtrack only. **Bitrate**
+  applies to MP3, M4A and Opus; FLAC and WAV are lossless so it is ignored.
 
-## Retrying
+Pick an audio format before downloading music, or you will get video files with
+the music inside them.
 
-Failed or cancelled jobs show a per-row **Retry** button, and **Retry failed**
-in the bottom bar re-queues all of them at once. The failure reason is shown
-inline in the Details column.
+---
 
-## ETA formatting
+## Playlists, channels and Spotify
 
-Remaining time is shown as `Ns` under a minute, `M:SS` under an hour, and
-`H:MM:SS` otherwise.
+### Playlists and channels
 
-## FFmpeg
+On by default. A playlist, channel, album or set link is read once when you
+press Start and queued as the individual videos behind it, each with its own
+card.
 
-FFmpeg is needed to merge separate video/audio streams and for every audio
-format.
+- **Videos per playlist** caps how many one link contributes. Useful against a
+  channel with thousands of uploads. `All` takes every one.
+- **Save each playlist in its own subfolder** keeps things tidy by putting each
+  playlist's videos in a folder named after it.
+- Turn the whole thing off and a playlist link brings down just one video.
 
-**The installer brings FFmpeg with it.** It is placed in an `ffmpeg` folder
-beside the application, which is where the app looks, so an installed copy
-converts audio, merges streams and handles subtitles straight away, offline,
-with nothing to fetch. Settings says `Using the bundled FFmpeg` when that is
-the copy in play. This is why the installer is around 130 MB.
+A link that cannot be opened as a playlist — a YouTube mix, a private list —
+quietly falls back to downloading the single video it points at.
 
-The portable `VideoBatchDownloader.exe` is a single file and stays lean, so it
-has no FFmpeg inside it. Run it and press **Download** in Settings — or just
-start an audio batch, which offers the same download — and it fetches a build
-into an `ffmpeg` folder beside itself, once.
+### Posts with several photos or clips
 
-Whatever the source, FFmpeg is resolved in this order: the path set explicitly
-in Settings, then the `ffmpeg` folder beside the app, then `PATH`. So you can
-always override the bundled copy with your own build.
+An Instagram carousel is one post holding several items. It stays as one card
+and saves every item as its own file. Download these as video: a photo has no
+soundtrack, so an audio format will fail on it.
 
-Downloads come from gyan.dev (the Windows build provider linked from
-ffmpeg.org) over HTTPS and are checked against the SHA-256 published alongside
-the archive; a mismatch is discarded rather than used. The transfer resumes if
-the connection drops and can be cancelled.
+### Spotify links
 
-### FFmpeg licensing
+Spotify's own audio is copy-protected and cannot be downloaded — not here, not
+anywhere. What this app does instead is read a Spotify link to see *what is on
+it*, then find each track on **YouTube** or **SoundCloud** (your choice under
+**Find tracks on**) and download that.
 
-The bundled binaries are the gyan.dev `release-essentials` build, configured
-`--enable-gpl --enable-version3`, so they are covered by the **GNU General
-Public License version 3**. Redistributing them carries obligations, which the
-installer meets: `ffmpeg\LICENSE.txt` is the licence itself, and
-`ffmpeg\FFMPEG-NOTICE.txt` records what is included and where to get the
-complete corresponding source, free of charge.
+No Spotify account, login or setup is needed. Paste a track, album, playlist or
+artist link and each track becomes its own card, showing `Artist — Title` until
+the matched video's own title arrives.
 
-FFmpeg is a separate program that the app runs as an external process; no
-FFmpeg code is linked into the application, so Video Batch Downloader remains
-under its own licence. Deleting the `ffmpeg` folder and pointing Settings at
-your own build is explicitly supported.
+Because it works by searching, a track with a vague name can occasionally match
+the wrong upload — the card always shows what actually came down. Set an audio
+format first if you want music files.
 
-## Audio downloads (MP3 and friends)
+---
 
-The **Format** selector next to **Start download** switches the whole batch
-between video and audio-only. Audio choices are MP3, M4A, Opus, FLAC and WAV:
-yt-dlp grabs the best audio stream and FFmpeg converts it, so FFmpeg is
-required for these (the app says so inline if it cannot find it).
+## Finding videos without a link
 
-The bitrate used for the lossy codecs is set in Settings; FLAC and WAV are
-lossless, so that control is disabled for them. Skip-existing understands the
-chosen extension, so re-running an MP3 batch skips tracks already converted
-rather than downloading them again.
+The **Search** tab searches YouTube, SoundCloud, Bilibili, Niconico and Yahoo
+Video. Type a query, pick a site, and tick the results you want, then press
+**Add selected to queue** — or double-click a single result. Pasting a link
+into the search box just adds it to the queue.
+
+---
 
 ## Subtitles
 
-Settings has a **Subtitles** group that applies to the whole batch. The choices
-are no subtitles, save as an `.srt` file next to the video, embed a subtitle
-track in the MP4, or both. **Languages** takes codes separated by commas or
-spaces (`en, es`), or `all` for every language a video offers, and
-auto-generated captions can be accepted when a video has no human-made track.
+Settings has a **Subtitles** group that applies to the whole batch:
 
-Embedding runs through FFmpeg, so it needs the same FFmpeg as audio downloads
-and offers the built-in download if none is found; sidecar files are converted
-to `.srt` when FFmpeg is available and otherwise kept in whatever format the
-site serves. Audio-only formats ignore subtitles, and the group says so.
+| Choice | Result |
+|---|---|
+| **No subtitles** | Nothing extra. |
+| **Save as .srt file** | Captions saved next to the video. |
+| **Embed in the video** | Captions become a track inside the MP4, switchable in any player. |
+| **Embed and keep the file** | Both. |
 
-Captions never cost you the video. The request is first narrowed to the
-languages a video actually offers, so asking for `en` on a video without
-English captions downloads it with no captions instead of warning or failing.
-If the caption step still breaks — a 429 from the subtitle server, an FFmpeg
-convert or embed error — the video is downloaded again without subtitles rather
-than reported as failed, the row reads `Done … no subtitles`, and the reason is
-written to `download.log`.
+**Languages** takes codes separated by commas or spaces (`en, es`), or `all`
+for every language offered. Auto-generated captions can be accepted when
+there is no human-made track.
 
-## Quality and downloads
+Subtitles never cost you the video. If a video has none in the languages you
+asked for, or the captions will not download, you still get the video and the
+card says `no subtitles`.
 
-Quality is a maximum height, not an exact target. For example, 1080p selects
-the best compatible stream at or below 1080p where possible; lower-resolution
-sources are not upscaled. Sequential mode uses one worker. Parallel mode uses
-1–5 workers and defaults to 3.
+---
 
-The default output directory is `Video Batch Downloader` under your Videos
-folder. yt-dlp resumes partial downloads,
-uses retries for temporary failures, and merges to MP4 when FFmpeg is
-available. Existing final files can be skipped; `.part` files alone are not
-treated as completed files.
+## When downloads start failing
 
-## When a site throttles you
+Ask a site for a lot in a short time and it starts refusing — often with errors
+that look like the video is gone when really you are just going too fast.
 
-A long batch asks a lot of one site in a short time — each download costs a
-search, a page fetch and a player request — and the site eventually starts
-refusing. On YouTube that shows up in a particular way: the watch page begins
-coming back incomplete, which leaves yt-dlp without the visitor data its
-playback token is bound to, and the media URLs then answer `403 Forbidden`.
-The 403 is three steps downstream of the real cause, which is simply asking too
-fast.
+Two settings under **Download options** handle it:
 
-Two settings in **Download options** deal with it:
+- **Pause between requests** puts a gap between requests. This is the one that
+  prevents the problem. `Off` goes as fast as possible.
+- **Retry if throttled** gives a refused download more goes before giving up.
+
+When it happens, the whole batch waits rather than just the one download,
+because the block is on your connection. Those cards read `Holding off`. A
+video that genuinely is unavailable still fails straight away.
+
+If it keeps happening, lower **Workers**, raise the pause, or come back later.
+
+---
+
+## Settings worth knowing
 
 | Setting | Does |
 |---|---|
-| **Pause between requests** | A gap between the requests each download makes. This is prevention, and it is where it counts — the page fetch is what breaks first. `Off` asks as fast as possible. Default 0.75s. |
-| **Retry if throttled** | How many further goes a download gets when the site turns it away, rather than the video genuinely being unavailable. Default 2; `0` reports the first refusal as a failure. |
+| **Output folder** | Where files are saved. |
+| **Quality** | Maximum video height. |
+| **Mode / Workers** | Sequential does one at a time; Parallel does up to five at once. |
+| **Skip files that already exist** | Leaves alone anything already in the output folder, so a re-run picks up where it left off. |
+| **FFmpeg path** | Only needed if you want your own FFmpeg instead of the included one. |
 
-Being refused is a fact about the connection, not about one video, so a
-download that is turned away holds **the whole batch** back — 20 seconds, then
-60 — instead of the other workers carrying on and digging the hole deeper.
-Affected rows read `Holding off — the site is rate limiting` while they wait.
-Errors that mean the video really is unavailable are not retried and fail
-straight away, so a dead link still fails fast.
+Settings are saved when a download starts and when you close the app.
 
-If a batch is still being refused, lower the worker count, raise the pause, or
-come back later; the block is on your connection and lifts on its own.
+---
 
-## Building a standalone executable
+## History and the system tray
 
-```powershell
-.\build.ps1            # dist\VideoBatchDownloader.exe
-.\build.ps1 -Installer # also dist\VideoBatchDownloader-<version>-setup.exe
-```
+The **History** tab lists everything downloaded, with the time, title, status
+and where it went. Double-click a row to open its folder. **Clear** empties it.
 
-The first form runs PyInstaller with `VideoBatchDownloader.spec` and produces
-a single windowed executable (about 53 MB) that needs no Python install. It is
-portable: settings, history and the log are written beside it, so it can live
-on a USB stick.
+Closing the window keeps the app running in the system tray so downloads carry
+on. Click the tray icon to bring it back, or right-click it and choose **Exit**
+to quit properly. If a batch is still running, it will ask before closing.
 
-`-Installer` additionally compiles `installer.iss` with Inno Setup (install it
-from https://jrsoftware.org/isdl.php if `ISCC.exe` is not found). The installer
-is **per-user**: it needs no administrator rights, installs to
-`%LOCALAPPDATA%\Programs\Video Batch Downloader`, and adds Start Menu entries
-plus an optional desktop icon. A per-user location matters here because the app
-writes its settings, history, log and any auto-downloaded FFmpeg next to the
-executable, which a Program Files install would forbid. Uninstalling removes
-those files; downloaded videos are left alone.
+---
 
-FFmpeg is not bundled in either case — use the Download button in Settings, or
-keep FFmpeg on `PATH`.
+## If something goes wrong
 
-The spec pins the OpenSSL DLLs from the build interpreter and excludes Qt's
-OpenSSL plugin; without that, a same-named `libssl-3-x64.dll` earlier on
-`PATH` (Git's `mingw64\bin`, for example) can get bundled and break `ssl`.
+| Problem | Try this |
+|---|---|
+| A download failed | Read the reason on the card, then press **Retry** — many failures are temporary. |
+| Lots of failures at once | The site is probably rate limiting you. See [When downloads start failing](#when-downloads-start-failing). |
+| Audio formats are not working | FFmpeg is missing. In Settings, press **Download** next to the FFmpeg path. The installer version already has it. |
+| The wrong song downloaded from a Spotify link | It matched the wrong upload. Remove that card and paste the correct video link instead. |
+| A video downloads with no subtitles | It had none in the languages you asked for. Try adding more languages, or `all`. |
+| Something else | `download.log` next to the app records every download, with timestamps and errors. |
 
-## Troubleshooting
+---
 
-- If the app says yt-dlp is missing, run `uv sync` and launch with
-  `uv run python app.py`.
-- If downloads requiring separate audio/video streams fail, install FFmpeg or
-  choose its executable in the FFmpeg path field.
-- See `download.log` for timestamps, URLs, statuses, errors, and output paths.
-  A persistent record of every completed job is kept in `download_history.json`.
+## About FFmpeg
 
-## CLI fallback
+The app uses FFmpeg to convert audio, join separate video and audio streams,
+and handle subtitles. The installer includes it, so there is nothing to do. The
+portable version downloads it once, when it first needs it.
 
-`python app.py` launches the GUI. The project intentionally keeps the GUI as
-the primary interface; yt-dlp's Python API is used directly rather than by
-spawning a subprocess for each download.
+The included FFmpeg is licensed under the GNU General Public License v3. Its
+licence and a note saying where to get its source are in the `ffmpeg` folder
+beside the app. You are free to delete that folder and point the FFmpeg path in
+Settings at your own copy.

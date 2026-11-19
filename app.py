@@ -34,10 +34,7 @@ from downloader import (
 )
 import ffmpeg_setup
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
-from spotify import (
-    DEFAULT_MATCH_SOURCE, MATCH_SOURCES, SEARCH_KINDS, SpotifyCredentials, SpotifyError,
-    looks_like_spotify, search_spotify, spotify_tracks,
-)
+from spotify import DEFAULT_MATCH_SOURCE, MATCH_SOURCES, SpotifyError, looks_like_spotify, spotify_tracks
 
 
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -58,8 +55,6 @@ EVENTS_PER_TICK = 500
 # otherwise grow the file without limit, and every redraw with it.
 HISTORY_LIMIT = 2000
 
-# Marks a Search-tab source as Spotify rather than a yt-dlp search prefix.
-SPOTIFY_PREFIX = "spotify:"
 QUEUE_FILTERS = ("All", "Active", "Done", "Failed")
 TERMINAL = {"Completed", "Failed", "Cancelled", "Skipped"}
 RETRYABLE = {"Failed", "Cancelled"}
@@ -352,42 +347,16 @@ class SearchWorker(QThread):
     failed = Signal(int, str)
 
     def __init__(self, generation: int, query: str, prefix: str, limit: int,
-                 logger: logging.Logger, credentials: Any = None) -> None:
+                 logger: logging.Logger) -> None:
         super().__init__()
         self.generation, self.query, self.prefix, self.limit, self.logger = generation, query, prefix, limit, logger
-        self.credentials = credentials
 
     def run(self) -> None:
         try:
-            if self.prefix.startswith(SPOTIFY_PREFIX):
-                results = self._spotify(self.prefix[len(SPOTIFY_PREFIX):])
-            else:
-                results = search_videos(self.query, self.prefix, self.limit, self.logger)
-            self.finished_ok.emit(self.generation, results)
+            self.finished_ok.emit(
+                self.generation, search_videos(self.query, self.prefix, self.limit, self.logger))
         except Exception as exc:
             self.failed.emit(self.generation, clean_error(exc) or exc.__class__.__name__)
-
-    def _spotify(self, kind: str) -> list[SearchResult]:
-        """Spotify's own results, shaped like every other search result.
-
-        The URL kept is the Spotify page: queueing it goes through the same
-        expansion a pasted Spotify link does, so one album becomes its tracks.
-        """
-        found = search_spotify(self.query, self.credentials, kind, self.limit, self.logger)
-        results: list[SearchResult] = []
-        for item in found:
-            note = item.subtitle
-            if item.total_tracks:
-                note = f"{note}  ·  {item.total_tracks} tracks" if note else f"{item.total_tracks} tracks"
-            results.append(SearchResult(
-                title=item.name,
-                url=item.url,
-                site="Spotify",
-                uploader=note,
-                duration=item.duration_ms / 1000 if item.duration_ms else None,
-                thumbnail=item.artwork,
-            ))
-        return results
 
 
 class PlaylistWorker(QThread):
@@ -720,8 +689,6 @@ class MainWindow(QMainWindow):
         self._net = QNetworkAccessManager(self)
         self._thumb_cache: dict[str, QPixmap] = {}
         self._thumb_pending: set[str] = set()
-        self.spotify_creds = SpotifyCredentials(
-            self.settings.get("spotify_client_id", ""), self.settings.get("spotify_client_secret", ""))
 
         self._build_ui()
         self._build_tray()
@@ -965,8 +932,6 @@ class MainWindow(QMainWindow):
         self.search_site = QComboBox()
         for name, key in SEARCH_SITES:
             self.search_site.addItem(name, key)
-        for label, kind in SEARCH_KINDS:
-            self.search_site.addItem(f"Spotify {label.lower()}", SPOTIFY_PREFIX + kind)
         self.search_site.setMinimumWidth(140)
         self.search_limit = QSpinBox()
         self.search_limit.setRange(1, MAX_RESULTS)
@@ -1040,8 +1005,7 @@ class MainWindow(QMainWindow):
         self.search_btn.setEnabled(False)
         self.search_btn.setText("Searching…")
         self.search_status.setText(f"Searching {self.search_site.currentText()} for “{query}”…")
-        worker = SearchWorker(self._search_generation, query, prefix, self.search_limit.value(),
-                              self.logger, self.spotify_creds)
+        worker = SearchWorker(self._search_generation, query, prefix, self.search_limit.value(), self.logger)
         worker.finished_ok.connect(self._search_finished)
         worker.failed.connect(self._search_failed)
         worker.finished.connect(worker.deleteLater)
@@ -1365,32 +1329,6 @@ class MainWindow(QMainWindow):
         sp.addWidget(self.spotify_source, 0, 3)
         sp.addWidget(self.spotify_hint, 1, 0, 1, 4)
 
-        self.spotify_id_edit = QLineEdit(self.settings.get("spotify_client_id", ""))
-        self.spotify_id_edit.setPlaceholderText("Client ID from your Spotify app")
-        self.spotify_id_edit.editingFinished.connect(self._spotify_creds_changed)
-        self.spotify_secret_edit = QLineEdit(self.settings.get("spotify_client_secret", ""))
-        self.spotify_secret_edit.setPlaceholderText("Client Secret")
-        self.spotify_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.spotify_secret_edit.editingFinished.connect(self._spotify_creds_changed)
-        sp.addWidget(QLabel("Client ID"), 2, 0)
-        sp.addWidget(self.spotify_id_edit, 2, 1, 1, 3)
-        sp.addWidget(QLabel("Client Secret"), 3, 0)
-        sp.addWidget(self.spotify_secret_edit, 3, 1, 1, 3)
-        creds_row = QHBoxLayout()
-        self.spotify_creds_status = QLabel()
-        self.spotify_creds_status.setObjectName("muted")
-        self.spotify_creds_status.setWordWrap(True)
-        creds_row.addWidget(self.spotify_creds_status, 1)
-        self.spotify_test_btn = QPushButton("Test")
-        self.spotify_test_btn.setToolTip("Ask Spotify for a token with these credentials")
-        self.spotify_test_btn.clicked.connect(self._test_spotify_creds)
-        creds_row.addWidget(self.spotify_test_btn)
-        dash_btn = QPushButton("Get credentials")
-        dash_btn.setToolTip("Open the Spotify developer dashboard")
-        dash_btn.clicked.connect(lambda: QDesktopServices.openUrl(
-            QUrl("https://developer.spotify.com/dashboard")))
-        creds_row.addWidget(dash_btn)
-        sp.addLayout(creds_row, 4, 0, 1, 4)
         sp.setColumnStretch(1, 1)
         layout.addWidget(spot)
 
@@ -1433,7 +1371,6 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         self._mode_changed()
         self._pacing_changed()
-        self._update_spotify_creds_status()
         self._spotify_changed()
         self._playlists_changed()
         return page
@@ -1900,43 +1837,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, "retry_btn") and not self.manager.active:
             self._reload_links()
 
-    def _spotify_creds_changed(self) -> None:
-        """Rebuild the credentials when either field is edited."""
-        client_id = self.spotify_id_edit.text().strip()
-        secret = self.spotify_secret_edit.text().strip()
-        if not self.spotify_creds.matches(client_id, secret):
-            self.spotify_creds = SpotifyCredentials(client_id, secret)
-        self._update_spotify_creds_status()
-
-    def _update_spotify_creds_status(self, message: str = "", good: bool = False) -> None:
-        if message:
-            self.spotify_creds_status.setText(message)
-            self.spotify_creds_status.setStyleSheet(
-                f"color: {STATUS_COLORS['Completed'] if good else STATUS_COLORS['Failed']}")
-            return
-        ready = self.spotify_creds.configured
-        self.spotify_creds_status.setText(
-            "Searching Spotify is ready." if ready else
-            "Searching Spotify needs a free app from the dashboard; pasting Spotify links works without one."
-        )
-        self.spotify_creds_status.setStyleSheet(f"color: {MUTED}")
-        self.spotify_test_btn.setEnabled(ready)
-
-    def _test_spotify_creds(self) -> None:
-        self._spotify_creds_changed()
-        self.spotify_test_btn.setEnabled(False)
-        self.spotify_creds_status.setText("Asking Spotify…")
-        QApplication.processEvents()
-        try:
-            self.spotify_creds.token()
-        except SpotifyError as exc:
-            self._update_spotify_creds_status(str(exc), good=False)
-            self.logger.warning("Spotify credentials rejected: %s", exc)
-        else:
-            self._update_spotify_creds_status("Spotify accepted these credentials.", good=True)
-            self.logger.info("Spotify credentials accepted")
-        self.spotify_test_btn.setEnabled(self.spotify_creds.configured)
-
     def _pacing_changed(self, _value: Any = None) -> None:
         pause, retries = self.pause_spin.value(), self.throttle_retry_spin.value()
         if pause > 0:
@@ -2280,8 +2180,6 @@ class MainWindow(QMainWindow):
             "rate_limit_retries": self.throttle_retry_spin.value(),
             "spotify": self.spotify_check.isChecked(),
             "spotify_source": self.spotify_source.currentData() or DEFAULT_MATCH_SOURCE,
-            "spotify_client_id": self.spotify_id_edit.text().strip(),
-            "spotify_client_secret": self.spotify_secret_edit.text().strip(),
             "ffmpeg_path": self.ffmpeg_edit.text(),
             "search_limit": self.search_limit.value(),
         }
