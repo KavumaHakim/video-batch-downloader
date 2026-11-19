@@ -824,8 +824,11 @@ class MainWindow(QMainWindow):
 
         title = QLabel("Video Batch Downloader")
         title.setObjectName("title")
-        self.tool_label = QLabel("Checking yt-dlp and FFmpeg…")
+        # Hidden unless something is actually wrong; _check_tools decides.
+        self.tool_label = QLabel()
         self.tool_label.setObjectName("muted")
+        self.tool_label.setWordWrap(True)
+        self.tool_label.setVisible(False)
         layout.addWidget(title)
         layout.addWidget(self.tool_label)
 
@@ -2202,15 +2205,17 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- tools
     def _check_tools(self) -> None:
-        if yt_dlp is None:
-            self.tool_label.setText(f"yt-dlp failed to load — {YT_DLP_IMPORT_ERROR}" if YT_DLP_IMPORT_ERROR else "yt-dlp is missing — run: uv sync")
+        # Only worth saying when something is wrong: a line reporting that the
+        # app is working is just noise above every screen.
+        broken = yt_dlp is None
+        if broken:
+            self.tool_label.setText(
+                f"yt-dlp failed to load — {YT_DLP_IMPORT_ERROR}" if YT_DLP_IMPORT_ERROR
+                else "yt-dlp is missing — downloads cannot run")
             self.tool_label.setToolTip(YT_DLP_IMPORT_ERROR)
-            self.logger.error("yt-dlp import failed: %s", YT_DLP_IMPORT_ERROR)
             self.tool_label.setStyleSheet(f"color: {STATUS_COLORS['Failed']}")
-        else:
-            self.tool_label.setText("yt-dlp ready")
-            self.tool_label.setToolTip("")
-            self.tool_label.setStyleSheet(f"color: {STATUS_COLORS['Completed']}")
+            self.logger.error("yt-dlp import failed: %s", YT_DLP_IMPORT_ERROR)
+        self.tool_label.setVisible(broken)
         self._update_ffmpeg_status()
 
     def _update_ffmpeg_status(self) -> None:
