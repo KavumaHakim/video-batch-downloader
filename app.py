@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from downloader import (
-    AUDIO_FORMATS, DEFAULT_SUBTITLE_LANGS, EMBED_SUBTITLE_MODES, LOSSLESS_AUDIO, YT_DLP_IMPORT_ERROR,
+    AUDIO_FORMATS, DEFAULT_SUBTITLE_LANGS, DEFAULT_VIDEO_CODEC, EMBED_SUBTITLE_MODES, LOSSLESS_AUDIO, YT_DLP_IMPORT_ERROR,
     DownloadConfig, DownloadJob, DownloadManager, PlaylistEntry, clean_error, expand_playlist,
     drop_unresolvable_path_entries, find_ffmpeg, is_search_query, looks_like_playlist, subtitle_languages, yt_dlp,
 )
@@ -121,6 +121,15 @@ FORMAT_CHOICES: list[tuple[str, str]] = [
     ("Audio: WAV", "wav"),
 ]
 AUDIO_BITRATES = ["320", "256", "192", "128", "96"]
+
+# Combo label -> DownloadConfig.video_codec, with the note shown beside it.
+VIDEO_CODEC_CHOICES: list[tuple[str, str, str]] = [
+    ("H.264", "h264", "Plays on every PC and phone. YouTube offers it up to 1080p."),
+    ("Best quality (any codec)", "any",
+     "Highest resolution the site has, usually VP9 or AV1. Some PCs show those as a black screen."),
+    ("VP9", "vp9", "Smaller files, up to 4K. Needs a graphics card that decodes VP9."),
+    ("AV1", "av1", "Smallest files, up to 8K. Needs a recent graphics card that decodes AV1."),
+]
 
 # Combo label -> DownloadConfig.subtitle_mode ("" leaves subtitles alone).
 SUBTITLE_CHOICES: list[tuple[str, str]] = [
@@ -1375,6 +1384,19 @@ class MainWindow(QMainWindow):
         self.workers_spin.setValue(int(self.settings.get("workers", 3)))
         self.skip_check = QCheckBox("Skip files that already exist in the output folder")
         self.skip_check.setChecked(bool(self.settings.get("skip_existing", True)))
+        self.codec_box = QComboBox()
+        for label, code, note in VIDEO_CODEC_CHOICES:
+            self.codec_box.addItem(label, code)
+            self.codec_box.setItemData(self.codec_box.count() - 1, note, Qt.ItemDataRole.ToolTipRole)
+        saved_codec = self.settings.get("video_codec", DEFAULT_VIDEO_CODEC)
+        self.codec_box.setCurrentIndex(max(0, self.codec_box.findData(saved_codec)))
+        self.codec_box.setToolTip("The video codec to download in when the site offers it; "
+                                  "anything else is the fallback")
+        self.codec_box.currentIndexChanged.connect(self._codec_changed)
+        self.codec_label = QLabel("Video codec")
+        self.codec_note = QLabel()
+        self.codec_note.setObjectName("muted")
+        self.codec_note.setWordWrap(True)
         self.quality_label = QLabel("Quality")
         form.addWidget(self.quality_label, 0, 0)
         form.addWidget(self.quality_box, 0, 1)
@@ -1383,7 +1405,11 @@ class MainWindow(QMainWindow):
         form.addWidget(self.mode_box, 0, 3)
         form.addWidget(QLabel("Workers"), 0, 4)
         form.addWidget(self.workers_spin, 0, 5)
-        form.addWidget(self.skip_check, 1, 0, 1, 6)
+        form.addWidget(self.codec_label, 1, 0)
+        form.addWidget(self.codec_box, 1, 1)
+        form.addWidget(self.codec_note, 1, 2, 1, 4)
+        form.addWidget(self.skip_check, 2, 0, 1, 6)
+        self._codec_changed()
 
         self.pause_spin = QDoubleSpinBox()
         self.pause_spin.setRange(0.0, 5.0)
@@ -1401,14 +1427,14 @@ class MainWindow(QMainWindow):
         self.throttle_retry_spin.setToolTip("How many further goes a download gets when the site "
                                             "turns it away rather than the video being unavailable")
         self.throttle_retry_spin.valueChanged.connect(self._pacing_changed)
-        form.addWidget(QLabel("Pause between requests"), 2, 0)
-        form.addWidget(self.pause_spin, 2, 1)
-        form.addWidget(QLabel("Retry if throttled"), 2, 2)
-        form.addWidget(self.throttle_retry_spin, 2, 3)
+        form.addWidget(QLabel("Pause between requests"), 3, 0)
+        form.addWidget(self.pause_spin, 3, 1)
+        form.addWidget(QLabel("Retry if throttled"), 3, 2)
+        form.addWidget(self.throttle_retry_spin, 3, 3)
         self.pacing_hint = QLabel()
         self.pacing_hint.setObjectName("muted")
         self.pacing_hint.setWordWrap(True)
-        form.addWidget(self.pacing_hint, 3, 0, 1, 6)
+        form.addWidget(self.pacing_hint, 4, 0, 1, 6)
         form.setColumnStretch(1, 1)
         form.setColumnStretch(3, 1)
         layout.addWidget(opts)
@@ -2106,11 +2132,25 @@ class MainWindow(QMainWindow):
             self.playlist_folder_check.isChecked(),
             self.pause_spin.value(),
             self.throttle_retry_spin.value(),
+            video_codec=self._video_codec(),
         )
+
+    def _video_codec(self) -> str:
+        return self.codec_box.currentData() or DEFAULT_VIDEO_CODEC
+
+    def _codec_changed(self, _index: int = 0) -> None:
+        note = self.codec_box.currentData(Qt.ItemDataRole.ToolTipRole) or ""
+        self.codec_note.setText(note)
+        # Only H.264 is sure to play in the built-in player; say so for the rest.
+        warn = self._video_codec() != "h264"
+        self.codec_note.setStyleSheet(f"color: {STATUS_COLORS['Cancelled'] if warn else MUTED}")
 
     def _format_changed(self, _: str = "") -> None:
         codec = self._audio_format()
         audio = bool(codec)
+        # Audio downloads have no picture, so the video codec does not apply.
+        for widget in (self.codec_label, self.codec_box, self.codec_note):
+            widget.setVisible(not audio)
         self.quality_box.setVisible(not audio)
         self.bitrate_box.setVisible(audio)
         self.bitrate_box.setEnabled(codec not in LOSSLESS_AUDIO)
@@ -2582,6 +2622,7 @@ class MainWindow(QMainWindow):
         data = {
             "output_folder": self.output_edit.text(),
             "quality": self.quality_box.currentText(),
+            "video_codec": self._video_codec(),
             "format": self.format_box.currentText(),
             "audio_quality": self.bitrate_box.currentText().split()[0],
             "subtitles": self.subs_box.currentText(),

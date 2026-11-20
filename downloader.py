@@ -47,6 +47,18 @@ class DownloadJob:
 AUDIO_FORMATS = {"mp3": "mp3", "m4a": "m4a", "opus": "opus", "wav": "wav", "flac": "flac"}
 LOSSLESS_AUDIO = {"wav", "flac"}
 
+# DownloadConfig.video_codec -> the yt-dlp filter that picks it ("any" has none).
+# H.264 is the default because it plays on every PC; VP9 and AV1 are smaller
+# for the same quality and go higher than 1080p, but need a graphics card that
+# decodes them, or the picture stays black in many players.
+VIDEO_CODEC_FILTERS = {
+    "h264": "[vcodec~='^(avc|h264)']",
+    "vp9": "[vcodec~='^vp0?9']",
+    "av1": "[vcodec^=av01]",
+    "any": "",
+}
+DEFAULT_VIDEO_CODEC = "h264"
+
 # DownloadConfig.subtitle_mode values ("" leaves subtitles alone).
 EMBED_SUBTITLE_MODES = {"embed", "both"}
 KEEP_SUBTITLE_MODES = {"file", "both"}
@@ -112,6 +124,7 @@ class DownloadConfig:
     playlist_folders: bool = True  # save each playlist into its own subfolder
     request_pause: float = 0.75  # seconds between requests; 0 asks as fast as it can
     rate_limit_retries: int = 2  # goes at a throttled download before giving up
+    video_codec: str = DEFAULT_VIDEO_CODEC  # a VIDEO_CODEC_FILTERS key: preferred, not required
 
     @property
     def audio_only(self) -> bool:
@@ -612,7 +625,7 @@ class DownloadManager:
                 extract["preferredquality"] = config.audio_quality
             postprocessors.append(extract)
         else:
-            options["format"] = self._format_for(config.quality)
+            options["format"] = self._format_for(config.quality, config.video_codec)
             options["merge_output_format"] = "mp4"
         if with_subtitles and config.wants_subtitles:
             postprocessors.extend(self._subtitle_options(options, config, bool(resolved)))
@@ -651,23 +664,22 @@ class DownloadManager:
         return hook
 
     @staticmethod
-    def _format_for(quality: str) -> str:
-        """The yt-dlp format for a Quality setting, preferring H.264 up to 1080p.
+    def _format_for(quality: str, codec: str = DEFAULT_VIDEO_CODEC) -> str:
+        """The yt-dlp format for the Quality and Video codec settings.
 
-        A site's "best" is often VP9 or AV1, which plenty of PCs (and the
-        built-in player) can only show as a black screen. H.264 plays
-        everywhere and YouTube offers it up to 1080p, so it comes first unless
-        the setting asks for more than that, which only VP9/AV1 can give.
+        The codec is a preference: the best stream in that codec within the
+        quality cap comes first, and anything else is the fallback, so a site
+        that does not offer it still downloads. With H.264, YouTube tops out
+        at 1080p even when the cap is higher; "any" takes whatever is best.
         """
-        h264 = "[vcodec~='^(avc|h264)']"
-        if quality == "Best available":
-            return f"bv*{h264}+ba[ext=m4a]/bv*{h264}+ba/b{h264}/bv*+ba/b"
-        height = int(quality.rstrip("p"))
-        cap = f"[height<={height}]"
+        cap = "" if quality == "Best available" else f"[height<={int(quality.rstrip('p'))}]"
         fallback = f"bv*{cap}+ba/b{cap}/b"
-        if height > 1080:
+        wanted = VIDEO_CODEC_FILTERS.get(codec, VIDEO_CODEC_FILTERS[DEFAULT_VIDEO_CODEC])
+        if not wanted:
             return fallback
-        return f"bv*{cap}{h264}+ba[ext=m4a]/bv*{cap}{h264}+ba/b{cap}{h264}/{fallback}"
+        # H.264 sits best beside AAC, the soundtrack every MP4 player expects.
+        with_aac = f"bv*{cap}{wanted}+ba[ext=m4a]/" if codec == "h264" else ""
+        return f"{with_aac}bv*{cap}{wanted}+ba/b{cap}{wanted}/{fallback}"
 
     def _progress_hook(
         self, job: DownloadJob, state: Optional[dict[str, Any]] = None

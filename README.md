@@ -108,10 +108,19 @@ The **Format** box at the bottom of the window decides what you end up with.
 
 - **Video (MP4)** — the normal choice. Use **Quality** in Settings to cap the
   resolution; it is a maximum, so a lower-quality source is not stretched to
-  match. Up to 1080p the app picks H.264 video, which plays on any PC and in
-  the built-in player. Asking for 1440p or 2160p gets VP9 or AV1, the only
-  formats sites offer that high; some PCs cannot play those without converting
-  them first (see [The player](#the-player)).
+  match. **Video codec** picks the kind of video stream:
+  - **H.264** (the default) plays on every PC, phone and TV, and in the
+    built-in player. YouTube offers it up to 1080p, so that is the most it
+    gives even if Quality allows more.
+  - **Best quality (any codec)** takes the highest resolution the site has,
+    usually VP9 or AV1.
+  - **VP9** or **AV1** ask for that codec specifically: smaller files, and
+    higher resolutions than H.264.
+
+  The codec is a preference, so a site that does not offer it still
+  downloads in whatever it has. VP9 and AV1 need a graphics card that decodes
+  them; on a PC without one they play as a black screen, and the built-in
+  player offers to convert them (see [The player](#the-player)).
 - **Audio: MP3, M4A, Opus, FLAC or WAV** — the soundtrack only. **Bitrate**
   applies to MP3, M4A and Opus; FLAC and WAV are lossless so it is ignored.
 
