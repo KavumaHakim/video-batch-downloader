@@ -34,6 +34,7 @@ from downloader import (
     drop_unresolvable_path_entries, find_ffmpeg, is_search_query, looks_like_playlist, subtitle_languages, yt_dlp,
 )
 import ffmpeg_setup
+from media_files import PlayItem, is_playable
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
 from spotify import DEFAULT_MATCH_SOURCE, MATCH_SOURCES, SpotifyError, looks_like_spotify, spotify_tracks
 
@@ -520,7 +521,7 @@ class JobCardDelegate(QStyledItemDelegate):
         if job.status in RETRYABLE:
             return "Retry"
         if job.status in {"Completed", "Skipped"} and job.output_path:
-            return "Open"
+            return "Play" if is_playable(job.output_path) else "Open"
         return ""
 
     # --------------------------------------------------------------- painting
@@ -759,6 +760,8 @@ class MainWindow(QMainWindow):
         self._thumb_cache: dict[str, QPixmap] = {}
         self._thumb_pending: set[str] = set()
         self._thumb_wanted: set[str] = set()
+        self._player: Any = None                  # the player window, made on first use
+        self._player_volume = int(self.settings.get("player_volume", 80))
 
         self._build_ui()
         self._build_tray()
@@ -857,7 +860,13 @@ class MainWindow(QMainWindow):
         self.tool_label.setObjectName("muted")
         self.tool_label.setWordWrap(True)
         self.tool_label.setVisible(False)
-        layout.addWidget(title)
+        title_row = QHBoxLayout()
+        title_row.addWidget(title, 1)
+        player_btn = QPushButton("Player")
+        player_btn.setToolTip("Open the media player")
+        player_btn.clicked.connect(self.show_player)
+        title_row.addWidget(player_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(title_row)
         layout.addWidget(self.tool_label)
 
         self.tabs = QTabWidget()
@@ -992,6 +1001,11 @@ class MainWindow(QMainWindow):
             self.filter_buttons[name] = chip
             bar.addWidget(chip)
         bar.addStretch(1)
+        self.play_done_btn = QPushButton("Play finished")
+        self.play_done_btn.setObjectName("small")
+        self.play_done_btn.setToolTip("Play everything that has finished downloading, in queue order")
+        self.play_done_btn.clicked.connect(self._play_finished)
+        bar.addWidget(self.play_done_btn)
         self.clear_done_btn = QPushButton("Clear finished")
         self.clear_done_btn.setObjectName("small")
         self.clear_done_btn.setToolTip("Take everything that finished or was skipped out of the queue")
@@ -1083,6 +1097,8 @@ class MainWindow(QMainWindow):
         h.resizeSection(5, 80)
         h.setStretchLastSection(False)
         self.search_table.cellDoubleClicked.connect(self._search_row_double_clicked)
+        self.search_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.search_table.customContextMenuRequested.connect(self._search_menu)
         self.search_table.itemChanged.connect(lambda _item: self._update_search_selection())
         layout.addWidget(self.search_table, 1)
 
@@ -1094,11 +1110,14 @@ class MainWindow(QMainWindow):
         select_all.clicked.connect(lambda: self._set_all_search_checks(True))
         select_none = QPushButton("Select none")
         select_none.clicked.connect(lambda: self._set_all_search_checks(False))
+        self.stream_btn = QPushButton("Play")
+        self.stream_btn.setToolTip("Stream the ticked results (or the highlighted one) without downloading")
+        self.stream_btn.clicked.connect(self._stream_search_results)
         self.add_selected_btn = QPushButton("Add selected to queue")
         self.add_selected_btn.setObjectName("primary")
         self.add_selected_btn.setEnabled(False)
         self.add_selected_btn.clicked.connect(self._add_selected_results)
-        for btn in (select_all, select_none, self.add_selected_btn):
+        for btn in (select_all, select_none, self.stream_btn, self.add_selected_btn):
             footer.addWidget(btn)
         layout.addLayout(footer)
         return page
@@ -1266,7 +1285,7 @@ class MainWindow(QMainWindow):
         self.history_count = QLabel()
         self.history_count.setObjectName("muted")
         bar.addWidget(self.history_count, 1)
-        hint = QLabel("Double-click a row to open its folder")
+        hint = QLabel("Double-click to play  ·  right-click for more")
         hint.setObjectName("muted")
         bar.addWidget(hint)
         refresh = QPushButton("Refresh")
@@ -1295,7 +1314,10 @@ class MainWindow(QMainWindow):
         h.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         h.resizeSection(3, 260)
         h.resizeSection(4, 320)
+        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.history_table.cellDoubleClicked.connect(self._open_history_row)
+        self.history_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.history_table.customContextMenuRequested.connect(self._history_menu)
         layout.addWidget(self.history_table, 1)
         return page
 
@@ -1781,6 +1803,8 @@ class MainWindow(QMainWindow):
         """The button painted on a card was clicked."""
         if action == "Retry":
             self._retry_jobs([job])
+        elif action == "Play":
+            self._play_jobs([job])
         elif action == "Open":
             self._reveal(job.output_path)
 
@@ -1788,7 +1812,9 @@ class MainWindow(QMainWindow):
         job = self.jobs_by_id.get(item.data(Qt.ItemDataRole.UserRole))
         if job is None:
             return
-        if job.output_path:
+        if self._file_item(job.output_path, job.title, job.url, job.thumbnail) is not None:
+            self._play_jobs([job])
+        elif job.output_path:
             self._reveal(job.output_path)
         elif is_basic_url(job.url):
             QDesktopServices.openUrl(QUrl(job.url))
@@ -1809,7 +1835,10 @@ class MainWindow(QMainWindow):
         if job is None:
             return
         selected = self._selected_jobs() or [job]
+        if job not in selected:
+            selected = [job]
         menu = QMenu(self)
+        self._add_play_actions(menu, [self._job_item(j) for j in selected])
         if job.output_path:
             menu.addAction("Open containing folder", lambda: self._reveal(job.output_path))
         if is_basic_url(job.url):
@@ -1827,6 +1856,182 @@ class MainWindow(QMainWindow):
             menu.addAction(f"Remove {len(selected)} from the queue" if len(selected) > 1
                            else "Remove from the queue", lambda: self._remove_jobs(selected))
         menu.exec(self.jobs_list.viewport().mapToGlobal(point))
+
+    # --------------------------------------------------------------- player
+    def player_window(self) -> Any:
+        """The player, made the first time it is needed.
+
+        QtMultimedia and its FFmpeg are only loaded here, so starting the app
+        costs nothing for someone who never plays anything.
+        """
+        if self._player is None:
+            from player import PlayerWindow
+            self._player = PlayerWindow(self.logger, self._player_volume, app_icon(),
+                                        lambda: find_ffmpeg(self.ffmpeg_edit.text().strip()))
+            self._player.volume_changed.connect(self._player_volume_changed)
+            self._player.file_replaced.connect(self._file_replaced)
+        return self._player
+
+    def _player_volume_changed(self, value: int) -> None:
+        self._player_volume = value
+
+    def _file_replaced(self, old: str, new: str) -> None:
+        """A download was converted for playback; point everything at the new file."""
+        if old == new:
+            return
+        for job in self.jobs:
+            if job.output_path == old:
+                job.output_path = new
+        changed = False
+        for entry in self.history:
+            if entry.get("output_path") == old:
+                entry["output_path"] = new
+                changed = True
+        if changed:
+            self._history_changed()
+
+    def show_player(self) -> None:
+        window = self.player_window()
+        if window.isMinimized():
+            window.showNormal()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def play(self, items: list[PlayItem | None], replace: bool = False) -> None:
+        picked = [item for item in items if item is not None]
+        if not picked:
+            return
+        self.show_player()
+        self.player_window().play_items(picked, replace=replace)
+
+    def enqueue(self, items: list[PlayItem | None]) -> None:
+        picked = [item for item in items if item is not None]
+        if not picked:
+            return
+        added = self.player_window().enqueue(picked)
+        self.status_label.setText(f"Added {added} to the player queue." if added
+                                  else "Those are already in the player queue.")
+
+    @staticmethod
+    def _file_item(path: str, title: str, url: str = "", thumbnail: str = "") -> PlayItem | None:
+        """A queue entry for a downloaded file, if it is media and still there."""
+        if not path or not is_playable(path) or not Path(path).is_file():
+            return None
+        source = source_label(url) if url else ""
+        name = Path(path).name
+        return PlayItem(title=title or Path(path).stem, path=path, page_url=url, thumbnail=thumbnail,
+                        subtitle=f"{source}  ·  {name}" if source else name)
+
+    def _stream_item(self, url: str, title: str = "", thumbnail: str = "") -> PlayItem | None:
+        """A queue entry that plays a link without downloading it.
+
+        It follows the Format setting: with an audio format chosen, only the
+        soundtrack is streamed, which is lighter and is what would be saved.
+        A Spotify track is matched by a search, so it is always audio.
+        """
+        if not url or not is_queueable(url) or looks_like_spotify(url):
+            return None
+        return PlayItem(title=title or url, page_url=url, thumbnail=thumbnail,
+                        audio_only=bool(self._audio_format()) or is_search_query(url),
+                        subtitle=f"Streaming  ·  {source_label(url)}")
+
+    def _job_item(self, job: DownloadJob) -> PlayItem | None:
+        return (self._file_item(job.output_path, job.title, job.url, job.thumbnail)
+                or self._stream_item(job.url, job.title, job.thumbnail))
+
+    def _add_play_actions(self, menu: QMenu, items: list[PlayItem | None]) -> None:
+        """Play / queue entries for a context menu, worded for what they will do."""
+        picked = [item for item in items if item is not None]
+        if not picked:
+            return
+        streams = sum(1 for item in picked if item.is_stream)
+        verb = "Stream" if streams == len(picked) else "Play"
+        count = f" {len(picked)} items" if len(picked) > 1 else ""
+        menu.addAction(f"{verb}{count}", lambda: self.play(picked))
+        menu.addAction(f"Add{count} to the player queue", lambda: self.enqueue(picked))
+        menu.addSeparator()
+
+    def _play_jobs(self, jobs: list[DownloadJob]) -> None:
+        self.play([self._job_item(job) for job in jobs])
+
+    def _play_finished(self) -> None:
+        items = [self._file_item(job.output_path, job.title, job.url, job.thumbnail)
+                 for job in self.jobs if job.status in {"Completed", "Skipped"}]
+        if not any(items):
+            self.status_label.setText("Nothing that has finished downloading can be played yet.")
+            return
+        self.play(items, replace=True)
+
+    def _history_entry(self, row: int) -> dict[str, Any]:
+        item = self.history_table.item(row, 0)
+        entry = item.data(Qt.ItemDataRole.UserRole + 1) if item else None
+        return entry if isinstance(entry, dict) else {}
+
+    def _history_item(self, entry: dict[str, Any]) -> PlayItem | None:
+        title, url, thumb = entry.get("title", ""), entry.get("url", ""), entry.get("thumbnail", "")
+        return (self._file_item(entry.get("output_path", ""), title, url, thumb)
+                or self._stream_item(url, title, thumb))
+
+    def _history_menu(self, point: Any) -> None:
+        index = self.history_table.indexAt(point)
+        if not index.isValid():
+            return
+        rows = sorted({i.row() for i in self.history_table.selectionModel().selectedRows()})
+        if index.row() not in rows:
+            rows = [index.row()]
+        entries = [self._history_entry(row) for row in rows]
+        entry = self._history_entry(index.row())
+        menu = QMenu(self)
+        self._add_play_actions(menu, [self._history_item(e) for e in entries if e])
+        path = entry.get("output_path", "")
+        if path and Path(path).parent.exists():
+            menu.addAction("Open containing folder",
+                           lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent))))
+        url = entry.get("url", "")
+        if is_basic_url(url):
+            menu.addAction("Open the source page", lambda: QDesktopServices.openUrl(QUrl(url)))
+        if url:
+            menu.addAction("Copy link", lambda: QApplication.clipboard().setText(url))
+        if not menu.isEmpty():
+            menu.exec(self.history_table.viewport().mapToGlobal(point))
+
+    def _search_targets(self) -> list[SearchResult]:
+        """The ticked results, or else the highlighted rows."""
+        picked = self._checked_results()
+        if picked:
+            return picked
+        rows = sorted({i.row() for i in self.search_table.selectionModel().selectedRows()})
+        return [self.search_results[row] for row in rows if 0 <= row < len(self.search_results)]
+
+    def _search_item(self, result: SearchResult) -> PlayItem | None:
+        item = self._stream_item(result.url, result.title, result.thumbnail)
+        if item is not None and result.uploader:
+            item.subtitle = f"Streaming  ·  {result.uploader}"
+        return item
+
+    def _stream_search_results(self) -> None:
+        results = self._search_targets()
+        if not results:
+            self.search_status.setText("Tick or highlight a result to play it.")
+            return
+        self.play([self._search_item(result) for result in results])
+
+    def _search_menu(self, point: Any) -> None:
+        index = self.search_table.indexAt(point)
+        if not index.isValid() or index.row() >= len(self.search_results):
+            return
+        rows = sorted({i.row() for i in self.search_table.selectionModel().selectedRows()})
+        if index.row() not in rows:
+            rows = [index.row()]
+        results = [self.search_results[row] for row in rows if row < len(self.search_results)]
+        menu = QMenu(self)
+        self._add_play_actions(menu, [self._search_item(result) for result in results])
+        count = f" {len(results)}" if len(results) > 1 else ""
+        menu.addAction(f"Download{count}", lambda: self._queue_results(results))
+        if results[0].url.startswith("http"):
+            menu.addAction("Open the source page", lambda: QDesktopServices.openUrl(QUrl(results[0].url)))
+        menu.exec(self.search_table.viewport().mapToGlobal(point))
 
     # ----------------------------------------------------------- thumbnails
     def thumbnail_for(self, job: DownloadJob) -> QPixmap | None:
@@ -2395,6 +2600,7 @@ class MainWindow(QMainWindow):
             "incognito": self.incognito_check.isChecked(),
             "ffmpeg_path": self.ffmpeg_edit.text(),
             "search_limit": self.search_limit.value(),
+            "player_volume": self._player_volume,
         }
         try:
             SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -2457,6 +2663,7 @@ class MainWindow(QMainWindow):
             "media_count": job.media_count,
             "downloaded_bytes": job.downloaded_bytes,
             "total_bytes": job.total_bytes,
+            "thumbnail": job.thumbnail,
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         }
         key = (job.url, job.status)
@@ -2514,6 +2721,8 @@ class MainWindow(QMainWindow):
                     item.setForeground(QColor(STATUS_COLORS["Failed"]))
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, entry.get("output_path", ""))
+                    # Rows can be re-sorted, so each carries the entry it shows.
+                    item.setData(Qt.ItemDataRole.UserRole + 1, entry)
                 table.setItem(row, col, item)
         table.setSortingEnabled(True)
         n = len(self.history)
@@ -2527,6 +2736,11 @@ class MainWindow(QMainWindow):
     def _open_history_row(self, row: int, _col: int) -> None:
         item = self.history_table.item(row, 0)
         path = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        entry = self._history_entry(row)
+        playable = self._file_item(path, entry.get("title", ""), entry.get("url", ""), entry.get("thumbnail", ""))
+        if playable is not None:
+            self.play([playable])
+            return
         if not path:
             return
         folder = Path(path).parent
@@ -2609,6 +2823,9 @@ class MainWindow(QMainWindow):
             self._playlist_worker.wait(3000)
         if self.manager.active:
             self.manager.cancel()
+        if self._player is not None:
+            self._player.shutdown()
+            self._player.close()
         self._save_settings()
         self._write_history()
         if self.tray:
@@ -2672,6 +2889,9 @@ def main() -> None:
     apply_theme(app)
     window = MainWindow()
     window.show()
+    # Media files handed to the exe ("Open with", or dropped on its icon) go
+    # straight to the player.
+    window.play([MainWindow._file_item(arg, "") for arg in sys.argv[1:]])
     sys.exit(app.exec())
 
 

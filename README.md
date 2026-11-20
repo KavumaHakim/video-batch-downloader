@@ -71,17 +71,20 @@ you its state at a glance.
 **Things you can do to a card**
 
 - The button on the right changes with the state: **Retry** a failed download,
-  or **Open** the folder of a finished one.
-- **Double-click** a card to open its folder, or the original page if it has
-  not downloaded yet.
-- **Right-click** for everything else: open the folder or the source page, copy
-  the link or the error, retry, or remove it from the queue. Select several
-  cards first and it applies to all of them.
+  **Play** a finished video or song in the built-in player, or **Open** the
+  folder of anything else that finished (photos, for instance).
+- **Double-click** a card to play it, or the original page if it has not
+  downloaded yet.
+- **Right-click** for everything else: play it or add it to the player queue,
+  stream it without downloading, open the folder or the source page, copy the
+  link or the error, retry, or remove it from the queue. Select several cards
+  first and it applies to all of them.
 
 **Above the list**, the **All / Active / Done / Failed** buttons filter what you
 are looking at and show how many of each there are, and the thin bar underneath
-is the progress of the whole batch. **Clear finished** tidies away everything
-that completed, taking it out of the links box too.
+is the progress of the whole batch. **Play finished** plays everything that has
+downloaded, in order, and **Clear finished** tidies away everything that
+completed, taking it out of the links box too.
 
 **Retry failed** at the bottom re-runs everything that failed in one go, and
 tells you how many it will do. You do not have to wait for the batch to end —
@@ -105,7 +108,10 @@ The **Format** box at the bottom of the window decides what you end up with.
 
 - **Video (MP4)** — the normal choice. Use **Quality** in Settings to cap the
   resolution; it is a maximum, so a lower-quality source is not stretched to
-  match.
+  match. Up to 1080p the app picks H.264 video, which plays on any PC and in
+  the built-in player. Asking for 1440p or 2160p gets VP9 or AV1, the only
+  formats sites offer that high; some PCs cannot play those without converting
+  them first (see [The player](#the-player)).
 - **Audio: MP3, M4A, Opus, FLAC or WAV** — the soundtrack only. **Bitrate**
   applies to MP3, M4A and Opus; FLAC and WAV are lossless so it is ignored.
 
@@ -159,7 +165,41 @@ format first if you want music files.
 The **Search** tab searches YouTube, SoundCloud, Bilibili, Niconico and Yahoo
 Video. Type a query, pick a site, and tick the results you want, then press
 **Add selected to queue** — or double-click a single result. Pasting a link
-into the search box just adds it to the queue.
+into the search box just adds it to the queue. **Play** streams the ticked (or
+highlighted) results in the player without downloading them, and right-clicking
+a result offers the same.
+
+---
+
+## The player
+
+The app has its own player, so you can watch or listen without leaving it. It
+opens from **Player** at the top of the window, from **Play** on a finished
+card, by double-clicking a row in History, or from **Play** in Search. It also
+opens any media file you start the app with, such as from **Open with**.
+
+- **Play / pause, seek, volume, fullscreen** — click anywhere on the progress
+  bar to jump there, and double-click the picture for fullscreen. In fullscreen
+  the controls hide while it plays and come back when you move the mouse.
+- **The queue** on the right is what plays next. **Play** starts something now
+  and puts it after what was playing; **Add to the player queue** (right-click)
+  puts it at the end. Drag to reorder, **Del** removes, and **+** adds files from
+  disk. The repeat button cycles off, the whole queue, or one item.
+- **Audio** shows its artwork, or a placeholder, instead of a black screen.
+- **Streaming** plays a link without downloading it. With an audio format chosen
+  in **Format**, only the sound is streamed.
+
+Keys: **Space** or **K** play/pause, **←/→** skip 5 seconds, **J/L** 10 seconds,
+**↑/↓** volume, **M** mute, **F** fullscreen, **Esc** leaves fullscreen,
+**N/P** next and previous, **Q** shows or hides the queue.
+
+**Black screen with sound?** The player decodes H.264 on every PC, but VP9, AV1
+and HEVC only where the graphics card can, and many cannot. When that happens
+it says so and offers **Convert to H.264**, which uses FFmpeg to re-encode the
+picture and puts the converted file in place of the original, under the same
+name, so History still finds it. It takes roughly as long as the video plays
+for, needs FFmpeg (see [About FFmpeg](#about-ffmpeg)), and needs some free disk
+space while it works.
 
 ---
 
@@ -221,7 +261,8 @@ Settings are saved when a download starts and when you close the app.
 ## History and the system tray
 
 The **History** tab lists everything downloaded, with the time, title, status
-and where it went. Double-click a row to open its folder. **Clear** empties it.
+and where it went. Double-click a row to play it (or open its folder, if it is
+not something that plays), and right-click for more. **Clear** empties it.
 
 If you would rather it kept no list, tick **Incognito** under **Privacy** in
 Settings. While it is on, finished downloads are not added to History and
