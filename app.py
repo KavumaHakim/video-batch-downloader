@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from downloader import (
     AUDIO_FORMATS, DEFAULT_SUBTITLE_LANGS, EMBED_SUBTITLE_MODES, LOSSLESS_AUDIO, YT_DLP_IMPORT_ERROR,
     DownloadConfig, DownloadJob, DownloadManager, PlaylistEntry, clean_error, expand_playlist,
-    find_ffmpeg, is_search_query, looks_like_playlist, subtitle_languages, yt_dlp,
+    drop_unresolvable_path_entries, find_ffmpeg, is_search_query, looks_like_playlist, subtitle_languages, yt_dlp,
 )
 import ffmpeg_setup
 from search import MAX_RESULTS, SEARCH_SITES, SearchResult, format_duration, format_views, search_videos
@@ -2662,6 +2662,8 @@ def apply_theme(app: QApplication) -> None:
 
 def main() -> None:
     enable_crash_log()
+    for entry in drop_unresolvable_path_entries():
+        setup_logger().warning("Ignoring PATH entry Windows will not resolve: %s", entry)
     app = QApplication(sys.argv)
     app.setApplicationName("Video Batch Downloader")
     app.setWindowIcon(app_icon())

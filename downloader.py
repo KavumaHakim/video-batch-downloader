@@ -746,3 +746,28 @@ def find_ffmpeg(configured_path: str = "") -> Optional[str]:
         if candidate.is_file():
             return str(candidate)
     return None
+
+
+def drop_unresolvable_path_entries() -> list[str]:
+    """Remove PATH folders that Windows refuses to resolve, and return them.
+
+    yt-dlp calls os.path.realpath on every PATH entry while looking for a
+    JavaScript runtime, and realpath raises on a junction Windows marks as an
+    untrusted mount point (WinError 448), e.g. Scoop's per-user "current"
+    links. That one bad entry fails every download, so drop it up front: the
+    app never needs anything from such a folder.
+    """
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    kept: list[str] = []
+    dropped: list[str] = []
+    for entry in entries:
+        if entry:
+            try:
+                os.path.realpath(entry)
+            except (OSError, ValueError):
+                dropped.append(entry)
+                continue
+        kept.append(entry)
+    if dropped:
+        os.environ["PATH"] = os.pathsep.join(kept)
+    return dropped
