@@ -652,10 +652,22 @@ class DownloadManager:
 
     @staticmethod
     def _format_for(quality: str) -> str:
+        """The yt-dlp format for a Quality setting, preferring H.264 up to 1080p.
+
+        A site's "best" is often VP9 or AV1, which plenty of PCs (and the
+        built-in player) can only show as a black screen. H.264 plays
+        everywhere and YouTube offers it up to 1080p, so it comes first unless
+        the setting asks for more than that, which only VP9/AV1 can give.
+        """
+        h264 = "[vcodec~='^(avc|h264)']"
         if quality == "Best available":
-            return "bv*+ba/b"
+            return f"bv*{h264}+ba[ext=m4a]/bv*{h264}+ba/b{h264}/bv*+ba/b"
         height = int(quality.rstrip("p"))
-        return f"bv*[height<={height}]+ba/b[height<={height}]/b"
+        cap = f"[height<={height}]"
+        fallback = f"bv*{cap}+ba/b{cap}/b"
+        if height > 1080:
+            return fallback
+        return f"bv*{cap}{h264}+ba[ext=m4a]/bv*{cap}{h264}+ba/b{cap}{h264}/{fallback}"
 
     def _progress_hook(
         self, job: DownloadJob, state: Optional[dict[str, Any]] = None
