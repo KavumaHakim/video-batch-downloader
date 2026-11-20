@@ -525,10 +525,25 @@ class JobCardDelegate(QStyledItemDelegate):
 
     # --------------------------------------------------------------- painting
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        """Draw one card, and never let a failure escape.
+
+        An exception raised between save() and restore() leaves the painter's
+        state stack unbalanced, and a card is redrawn constantly while a batch
+        runs, so one bad frame would compound. In a windowed build the usual
+        traceback goes nowhere, so it is logged rather than lost.
+        """
+        painter.save()
+        try:
+            self._paint_card(painter, option, index)
+        except Exception:
+            self.window.logger.exception("Failed to draw a download card")
+        finally:
+            painter.restore()
+
+    def _paint_card(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         job = self._job(index)
         if job is None:
             return
-        painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         card = option.rect.adjusted(4, 3, -4, -3)
         hovered = job.job_id == self._hovered
@@ -597,7 +612,6 @@ class JobCardDelegate(QStyledItemDelegate):
         self._paint_status(painter, card, job, accent, small_metrics, pill_width)
         if action:
             self._paint_action(painter, self._action_rect(card), action, hovered)
-        painter.restore()
 
     def _subtitle(self, job: DownloadJob) -> str:
         bits = []
@@ -613,6 +627,10 @@ class JobCardDelegate(QStyledItemDelegate):
         path.addRoundedRect(QRectF(rect), 6, 6)
         painter.fillPath(path, QBrush(QColor(ART_BG)))
         pixmap = self.window.thumbnail_for(job)
+        if pixmap is None and job.thumbnail:
+            # Fetched when a card is actually drawn, so a playlist of hundreds
+            # does not open hundreds of connections for artwork nobody can see.
+            self.window.want_thumbnail_soon(job.thumbnail)
         if pixmap is not None and not pixmap.isNull():
             painter.save()
             painter.setClipPath(path)
@@ -676,8 +694,13 @@ class JobCardDelegate(QStyledItemDelegate):
             return False
         if event.type() == QEvent.Type.MouseMove:
             if self._hovered != job.job_id:
-                self._hovered = job.job_id
-                self.window.jobs_list.viewport().update()
+                # Only the card being left and the one being entered change.
+                # Repainting the whole viewport here meant redrawing every
+                # visible card for each mouse move, which is most of them
+                # while scrolling a long queue.
+                previous, self._hovered = self._hovered, job.job_id
+                self.window.repaint_job(previous)
+                self.window.repaint_job(job.job_id)
             return False
         if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
             card = option.rect.adjusted(4, 3, -4, -3)
@@ -735,6 +758,7 @@ class MainWindow(QMainWindow):
         self._net = QNetworkAccessManager(self)
         self._thumb_cache: dict[str, QPixmap] = {}
         self._thumb_pending: set[str] = set()
+        self._thumb_wanted: set[str] = set()
 
         self._build_ui()
         self._build_tray()
@@ -754,6 +778,10 @@ class MainWindow(QMainWindow):
         self._refresh_timer.setInterval(250)
         self._refresh_timer.timeout.connect(self._render_jobs)
         # Likewise for artwork arriving: repaint once, not once per image.
+        self._thumb_fetch_timer = QTimer(self)
+        self._thumb_fetch_timer.setSingleShot(True)
+        self._thumb_fetch_timer.setInterval(60)
+        self._thumb_fetch_timer.timeout.connect(self._fetch_wanted_thumbnails)
         self._thumb_timer = QTimer(self)
         self._thumb_timer.setSingleShot(True)
         self._thumb_timer.setInterval(120)
@@ -1647,27 +1675,28 @@ class MainWindow(QMainWindow):
             item.setSizeHint(QSize(0, JobCardDelegate.HEIGHT))
             self._card_rows[job.job_id] = self.jobs_list.count()
             self.jobs_list.addItem(item)
-            if job.thumbnail:
-                self._want_thumbnail(job.thumbnail)
         self.jobs_list.setUpdatesEnabled(True)
         self._update_summary()
+
+    def repaint_job(self, job_id: int) -> None:
+        """Redraw one card, if it is in the list the filter is showing."""
+        row = self._card_rows.get(job_id)
+        if row is None:
+            return
+        self.jobs_list.update(self.jobs_list.model().index(row, 0))
 
     def _sync_row(self, job: DownloadJob) -> None:
         """Repaint one card, without touching the rest of the list."""
         self.jobs_by_id[job.job_id] = job
-        if job.thumbnail:
-            self._want_thumbnail(job.thumbnail)
         if not self._passes_filter(job, self.queue_filter):
             # It no longer belongs in the view this filter shows.
             if job.job_id in self._card_rows:
                 self._refresh_timer.start()
             return
-        row = self._card_rows.get(job.job_id)
-        if row is None:
+        if job.job_id not in self._card_rows:
             self._refresh_timer.start()     # newly matches the filter
             return
-        index = self.jobs_list.model().index(row, 0)
-        self.jobs_list.update(index)
+        self.repaint_job(job.job_id)
 
     def _update_summary(self) -> None:
         # One pass: this runs on every status event, of which a long playlist
@@ -1802,6 +1831,18 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------- thumbnails
     def thumbnail_for(self, job: DownloadJob) -> QPixmap | None:
         return self._thumb_cache.get(job.thumbnail) if job.thumbnail else None
+
+    def want_thumbnail_soon(self, url: str) -> None:
+        """Note that a drawn card wants this artwork; fetch after the repaint."""
+        if not url or url in self._thumb_cache or url in self._thumb_pending:
+            return
+        self._thumb_wanted.add(url)
+        self._thumb_fetch_timer.start()
+
+    def _fetch_wanted_thumbnails(self) -> None:
+        wanted, self._thumb_wanted = self._thumb_wanted, set()
+        for url in wanted:
+            self._want_thumbnail(url)
 
     def _want_thumbnail(self, url: str) -> None:
         """Fetch artwork once, then repaint whatever is on screen."""
