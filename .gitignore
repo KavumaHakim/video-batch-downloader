@@ -28,3 +28,6 @@ ffmpeg/
 
 # Crash tracebacks written beside the app
 crash.log
+
+# Staged build output, used when dist is in use
+build_staging/
