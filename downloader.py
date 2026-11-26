@@ -533,8 +533,14 @@ class DownloadManager:
         self.logger.info("%s holds %d media items", job.url, job.media_count)
         # Every item carries the post's own title, so the plain template would
         # have them all write over one another.
-        ydl.params["outtmpl"]["default"] = str(
-            target_dir / "%(title).100B - %(playlist_index)s [%(id)s].%(ext)s")
+        template = str(target_dir / "%(title).100B - %(playlist_index)s [%(id)s].%(ext)s")
+        # yt-dlp normalises a string outtmpl into this dict in its constructor;
+        # read what is actually there rather than assuming the dict is present.
+        outtmpl = ydl.params.get("outtmpl")
+        if isinstance(outtmpl, dict):
+            outtmpl["default"] = template
+        else:
+            ydl.params["outtmpl"] = {"default": template}
         if config.skip_existing:
             # yt-dlp then leaves items that are already on disk alone.
             ydl.params["overwrites"] = None

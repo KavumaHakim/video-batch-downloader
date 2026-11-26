@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import subprocess
+import threading
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
@@ -87,6 +89,15 @@ class Transcoder(QThread):
         if process is not None and process.poll() is None:
             process.kill()
 
+    @staticmethod
+    def _drain(pipe: Any, sink: list[str]) -> None:
+        """Read a pipe to EOF into sink, so it never fills and blocks the process."""
+        try:
+            for line in pipe:
+                sink.append(line)
+        except (OSError, ValueError):
+            pass
+
     def run(self) -> None:
         source = self.source
         target = converted_path(source)
@@ -105,13 +116,25 @@ class Transcoder(QThread):
         try:
             self._process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                              encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
-            assert self._process.stdout is not None
+            if self._cancelled:
+                # Cancel arrived before the handle was stored, so cancel() could
+                # not reach the process; stop it now that we hold it.
+                self._process.kill()
+            assert self._process.stdout is not None and self._process.stderr is not None
+            # Drain stderr on its own thread. FFmpeg writes progress to stdout
+            # and its own messages to stderr; reading stdout to the end while a
+            # full stderr pipe buffer blocks FFmpeg would deadlock the pair.
+            stderr_lines: list[str] = []
+            stderr_reader = threading.Thread(
+                target=self._drain, args=(self._process.stderr, stderr_lines), daemon=True)
+            stderr_reader.start()
             for line in self._process.stdout:
                 key, _, value = line.strip().partition("=")
                 if key == "out_time_us" and value.isdigit() and self.duration_ms > 0:
                     self.progress.emit(min(99, int(int(value) / 1000 * 100 / self.duration_ms)))
-            errors = self._process.stderr.read() if self._process.stderr else ""
             code = self._process.wait()
+            stderr_reader.join(timeout=5)
+            errors = "".join(stderr_lines)
         except OSError as exc:
             code, errors = -1, str(exc)
         if self._cancelled or code != 0:
