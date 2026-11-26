@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import faulthandler
+import gc
 import json
 import logging
 import re
@@ -15,7 +16,7 @@ from queue import Empty, Queue
 from typing import Any
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QByteArray, QEvent, QModelIndex, QRect, QRectF, QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEvent, QModelIndex, QObject, QRect, QRectF, QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction, QBrush, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
     QFontMetrics, QIcon, QPainter, QPainterPath, QPalette, QPen, QPixmap,
@@ -267,6 +268,37 @@ def enable_crash_log() -> None:
         faulthandler.enable(file=_CRASH_HANDLE, all_threads=True)
     except OSError:
         pass            # a read-only folder must not stop the app starting
+
+
+class GuiThreadCollector(QObject):
+    """Run Python's cycle collector on the GUI thread, and only there.
+
+    Left to itself, the collector runs on whichever thread happens to be
+    allocating, which during a batch is usually a yt-dlp worker. It then walks
+    and frees Qt wrappers while the GUI thread is inside a Qt call that let go
+    of the GIL, such as painting a card. That is an access violation, and
+    crash.log showed exactly that every time: a worker "Garbage-collecting"
+    while the main thread painted, most often while scrolling a running batch.
+    Collecting from a timer here means it can never overlap Qt's own work.
+    """
+
+    INTERVAL_MS = 100       # short, so each collection has little to do
+
+    def __init__(self, parent: QObject) -> None:
+        super().__init__(parent)
+        self._threshold = max(1, gc.get_threshold()[0])
+        gc.disable()
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._collect)
+        self._timer.start()
+
+    def _collect(self) -> None:
+        # The same trigger the interpreter uses: enough new container objects.
+        # Generation 1 is the young objects plus a slice of the old ones, so
+        # long-lived garbage is still reclaimed over time.
+        if gc.get_count()[0] >= self._threshold:
+            gc.collect(1)
 
 
 def log_thread_exceptions(logger: logging.Logger) -> None:
@@ -2926,6 +2958,7 @@ def main() -> None:
     app.setApplicationName("Video Batch Downloader")
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
+    app._collector = GuiThreadCollector(app)   # before any download thread starts
     configure_tls()
     apply_theme(app)
     window = MainWindow()
