@@ -24,6 +24,8 @@ and log.
 Windows may warn that the app is from an unknown publisher, because the build
 is not code-signed. Choose **More info → Run anyway** if you are happy to.
 
+There is also an **Android version**: see [android/README.md](android/README.md).
+
 ---
 
 ## Downloading something

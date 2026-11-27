@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Android 9 and older: files saved under Download/ are shared from here. -->
+    <external-path name="external" path="." />
+</paths>
