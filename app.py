@@ -1928,7 +1928,16 @@ class MainWindow(QMainWindow):
                                         lambda: find_ffmpeg(self.ffmpeg_edit.text().strip()))
             self._player.volume_changed.connect(self._player_volume_changed)
             self._player.file_replaced.connect(self._file_replaced)
+            self._player.download_requested.connect(self._download_from_player)
         return self._player
+
+    def _download_from_player(self, url: str, title: str) -> None:
+        """The player's Download button: queue what is streaming and start it."""
+        if url not in set(self._collect_urls()):
+            self._append_direct(url)
+            self._reload_links()
+        self.status_label.setText(f"Downloading “{title or url}”.")
+        self._start()
 
     def _player_volume_changed(self, value: int) -> None:
         self._player_volume = value

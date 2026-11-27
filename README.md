@@ -199,10 +199,20 @@ opens any media file you start the app with, such as from **Open with**.
 - **Audio** shows its artwork, or a placeholder, instead of a black screen.
 - **Streaming** plays a link without downloading it. With an audio format chosen
   in **Format**, only the sound is streamed.
+- **Download** (⬇, shown while something streams) saves what's playing with
+  your current **Format** setting, and starts downloading straight away. You
+  can also right-click a streamed item in the queue and choose **Download**.
+- **Shuffle**, **−10 / +10** second skip buttons, and **playback speed**
+  (0.5× to 2×, at the same pitch) sit beside the play button.
+- **Radio:** right-click a YouTube item in the queue and choose **Start radio
+  from this** to replace what follows it with similar songs. **Autoplay**
+  (📻 beside UP NEXT) does the same when the queue runs out, so the music keeps
+  going. Turn it off to have playback stop at the end of the queue.
 
 Keys: **Space** or **K** play/pause, **←/→** skip 5 seconds, **J/L** 10 seconds,
 **↑/↓** volume, **M** mute, **F** fullscreen, **Esc** leaves fullscreen,
-**N/P** next and previous, **Q** shows or hides the queue.
+**N/P** next and previous, **Q** shows or hides the queue, **S** shuffle,
+**[ / ]** slower and faster.
 
 **Black screen with sound?** The player decodes H.264 on every PC, but VP9, AV1
 and HEVC only where the graphics card can, and many cannot. When that happens

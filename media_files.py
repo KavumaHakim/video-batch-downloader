@@ -42,6 +42,7 @@ class PlayItem:
     audio_url: str = ""
     resolved_at: float = 0.0
     has_video: bool = True
+    webpage: str = ""          # the page yt-dlp found, e.g. the video behind a search
     codec: str = ""            # set when the picture is in a codec the player cannot decode
 
     @property

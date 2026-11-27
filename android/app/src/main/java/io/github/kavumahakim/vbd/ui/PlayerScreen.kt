@@ -370,6 +370,7 @@ private fun PlayerTopBar(ui: PlayerUi, onClose: () -> Unit, onQueue: () -> Unit)
             if (ui.count > 1) Text("${ui.index + 1} of ${ui.count}", style = MaterialTheme.typography.labelLarge)
         }
         if (ui.streaming) {
+            DownloadButton(ui)
             DownloadCurrent(ui)
         } else IconButton(onClick = {
             if (ui.mediaUri.isEmpty()) return@IconButton
@@ -440,7 +441,34 @@ private fun LikeButton(player: Player) {
     }
 }
 
-/** ⋮ for the streamed song: radio, playlists, and saving it as audio or video. */
+/** ⬇ for the streamed song: save it as audio or as video. */
+@Composable
+private fun DownloadButton(ui: PlayerUi) {
+    val context = LocalContext.current
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }) { Icon(Icons.Rounded.Download, contentDescription = "Download this song") }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            listOf(true to "Download audio", false to "Download video").forEach { (audio, label) ->
+                DropdownMenuItem(
+                    text = { Text(label) },
+                    leadingIcon = { Icon(if (audio) Icons.Rounded.MusicNote else Icons.Rounded.Movie, null) },
+                    onClick = {
+                        open = false
+                        val page = Streams.known(ui.pageUrl)?.webpage?.ifEmpty { null } ?: ui.pageUrl
+                        Downloads.addSearchResults(
+                            listOf(SearchResult(ui.title, page, ui.subtitle, ui.duration / 1000.0, null, ui.artwork)),
+                            SettingsStore.current.copy(audioOnly = audio),
+                        )
+                        Toast.makeText(context, "Downloading ${if (audio) "audio" else "video"}", Toast.LENGTH_SHORT).show()
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** ⋮ for the streamed song: radio and playlists. */
 @Composable
 private fun DownloadCurrent(ui: PlayerUi) {
     val context = LocalContext.current
@@ -479,21 +507,6 @@ private fun DownloadCurrent(ui: PlayerUi) {
                     text = { Text("Add to playlist") },
                     leadingIcon = { Icon(Icons.AutoMirrored.Rounded.PlaylistAdd, null) },
                     onClick = { open = false; addTo = true },
-                )
-            }
-            listOf(true to "Download audio", false to "Download video").forEach { (audio, label) ->
-                DropdownMenuItem(
-                    text = { Text(label) },
-                    leadingIcon = { Icon(if (audio) Icons.Rounded.MusicNote else Icons.Rounded.Movie, null) },
-                    onClick = {
-                        open = false
-                        val page = Streams.known(ui.pageUrl)?.webpage?.ifEmpty { null } ?: ui.pageUrl
-                        Downloads.addSearchResults(
-                            listOf(SearchResult(ui.title, page, ui.subtitle, null, null, ui.artwork)),
-                            SettingsStore.current.copy(audioOnly = audio),
-                        )
-                        Toast.makeText(context, "Added to Downloads", Toast.LENGTH_SHORT).show()
-                    },
                 )
             }
         }

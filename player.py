@@ -7,6 +7,8 @@ the first time someone actually plays something.
 from __future__ import annotations
 
 import logging
+import random
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -24,7 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton, QSizePolicy, QSlider, QStackedWidget, QStyle, QStyleOptionSlider, QToolButton, QVBoxLayout, QWidget,
 )
 
-from downloader import yt_dlp
+from downloader import best_thumbnail, yt_dlp
 from transcode import Transcoder, codec_label, video_codec
 from media_files import MEDIA_FILTER, PlayItem
 
@@ -52,7 +54,23 @@ GLYPHS = {
     "queue": ("", "☰"), "repeat": ("", "🔁"), "repeat1": ("", "🔂"), "open": ("", "+"),
     "music": ("", "♪"), "video": ("", "▶"),
 }
+GLYPHS.update({
+    "download": (chr(0xE896), "⬇"), "shuffle": (chr(0xE8B1), "🔀"), "radio": (chr(0xE93E), "📻"),
+})
 REPEAT_MODES = ("off", "all", "one")
+SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+RADIO_SIZE = 25
+VIDEO_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
+
+
+def video_id(url: str) -> str:
+    """The YouTube video ID in a link, or "" when it has none."""
+    found = VIDEO_ID.search(url or "")
+    return found.group(1) if found else ""
+
+
+def speed_label(rate: float) -> str:
+    return f"{rate:g}×"
 
 PLAYER_STYLE = """
 QWidget#playerRoot { background: #0d1117; }
@@ -70,6 +88,9 @@ QToolButton#icon:hover { background: #21262d; color: #f0f6fc; }
 QToolButton#icon:pressed { background: #1c2128; }
 QToolButton#icon:checked { color: #58a6ff; }
 QToolButton#icon:disabled { color: #484f58; }
+QToolButton#text { background: transparent; color: #c9d1d9; border: none; border-radius: 6px; padding: 5px 7px; min-height: 30px; font-family: "Segoe UI"; font-size: 9pt; font-weight: 600; }
+QToolButton#text:hover { background: #21262d; color: #f0f6fc; }
+QToolButton#text::menu-indicator { image: none; width: 0; }
 QToolButton#play { background: #1f6feb; color: #ffffff; border: none; border-radius: 19px; min-width: 38px; max-width: 38px; min-height: 38px; max-height: 38px; font-size: 13pt; }
 QToolButton#play:hover { background: #388bfd; }
 QToolButton#play:pressed { background: #1a5fca; }
@@ -162,6 +183,7 @@ def resolve_stream(page_url: str, audio_only: bool, logger: logging.Logger | Non
         "title": info.get("title") or "",
         "thumbnail": info.get("thumbnail") or "",
         "uploader": info.get("uploader") or info.get("channel") or "",
+        "webpage": info.get("webpage_url") or "",
         "video_url": video_url,
         "audio_url": audio_url,
         "has_video": has_video,
@@ -206,6 +228,38 @@ class StreamResolver(QThread):
             message = str(exc).replace("ERROR: ", "").strip() or exc.__class__.__name__
             self.logger.warning("Could not stream %s: %s", self.page_url, message)
             self.failed.emit(self.token, message)
+
+
+class RadioFetcher(QThread):
+    """Reads YouTube's Mix for a video: the songs that go with it, as radio."""
+
+    found = Signal(int, list)          # token, [(url, title, thumbnail)]
+
+    def __init__(self, token: int, vid: str, logger: logging.Logger) -> None:
+        super().__init__()
+        self.token, self.vid, self.logger = token, vid, logger
+
+    def run(self) -> None:
+        entries: list[tuple[str, str, str]] = []
+        try:
+            if yt_dlp is None:
+                raise RuntimeError("yt-dlp is not available")
+            options = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
+                       "playlistend": RADIO_SIZE + 1, "logger": self.logger}
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={self.vid}&list=RD{self.vid}",
+                                        download=False)
+            for entry in (info or {}).get("entries") or []:
+                if not entry:
+                    continue
+                url = entry.get("url") or entry.get("webpage_url") or ""
+                if not url.startswith("http"):
+                    url = f"https://www.youtube.com/watch?v={entry.get('id', '')}" if entry.get("id") else ""
+                if url and video_id(url) != self.vid:
+                    entries.append((url, entry.get("title") or url, best_thumbnail(entry)))
+        except Exception as exc:  # network, removed video, a site change...
+            self.logger.warning("Radio for %s failed: %s", self.vid, exc)
+        self.found.emit(self.token, entries[:RADIO_SIZE])
 
 
 class ElidedLabel(QLabel):
@@ -396,6 +450,7 @@ class PlayerWindow(QWidget):
 
     volume_changed = Signal(int)
     file_replaced = Signal(str, str)        # old path, new path, after a conversion
+    download_requested = Signal(str, str)   # page URL, title: save what is streaming
 
     def __init__(self, logger: logging.Logger, volume: int = 80, icon: Any = None,
                  ffmpeg_locator: Callable[[], str | None] | None = None) -> None:
@@ -410,11 +465,19 @@ class PlayerWindow(QWidget):
             self.setWindowIcon(icon)
         self.setStyleSheet(PLAYER_STYLE)
         self.setMinimumSize(560, 380)
-        self.resize(1040, 640)
+        self.resize(1120, 660)
 
         self.items: list[PlayItem] = []
         self.current: PlayItem | None = None
         self.repeat = "off"
+        self.shuffle = False
+        self._shuffle_keys: list[str] = []  # play order while shuffle is on
+        self.rate = 1.0
+        self.autoplay = True                # when the queue ends, carry on with its radio
+        self._radio_token = 0
+        self._radio_seed = ""               # the song whose radio was last fetched
+        self._radio_append_and_play = False
+        self._radio_replace = False
         self._token = 0                     # stream resolves that finish late are ignored
         self._resolvers: set[StreamResolver] = set()
         self._want_play = False             # start once every part of the media has loaded
@@ -472,6 +535,16 @@ class PlayerWindow(QWidget):
         button.setText(self._glyph(glyph))
         button.setToolTip(tip)
         button.setCheckable(checkable)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        return button
+
+    @staticmethod
+    def _text_button(text: str, tip: str) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("text")
+        button.setText(text)
+        button.setToolTip(tip)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         return button
@@ -534,8 +607,14 @@ class PlayerWindow(QWidget):
         self.play_btn.clicked.connect(self.toggle_play)
         self.next_btn = self._icon_button("next", "Next (Ctrl+Right)")
         self.next_btn.clicked.connect(self.next)
+        self.back_btn = self._text_button("−10", "Back 10 seconds (J)")
+        self.back_btn.clicked.connect(lambda: self._skip(-10_000))
+        self.fwd_btn = self._text_button("+10", "Forward 10 seconds (L)")
+        self.fwd_btn.clicked.connect(lambda: self._skip(10_000))
         bar.addWidget(self.prev_btn)
+        bar.addWidget(self.back_btn)
         bar.addWidget(self.play_btn)
+        bar.addWidget(self.fwd_btn)
         bar.addWidget(self.next_btn)
         bar.addSpacing(10)
 
@@ -550,6 +629,20 @@ class PlayerWindow(QWidget):
         now.addWidget(self.now_sub)
         bar.addLayout(now, 1)
 
+        self.download_btn = self._icon_button("download", "Download this (follows the Format setting)")
+        self.download_btn.clicked.connect(self._download_current)
+        self.shuffle_btn = self._icon_button("shuffle", "Shuffle: off (S)", checkable=True)
+        self.shuffle_btn.toggled.connect(self._set_shuffle)
+        self.radio_btn = self._icon_button("radio", "", checkable=True)
+        self.radio_btn.setChecked(self.autoplay)
+        self.radio_btn.toggled.connect(self._set_autoplay)
+        self._set_autoplay(self.autoplay)
+        self.speed_btn = self._text_button(speed_label(1.0), "Playback speed")
+        speed_menu = QMenu(self.speed_btn)
+        for rate in SPEEDS:
+            speed_menu.addAction(speed_label(rate), lambda r=rate: self.set_speed(r))
+        self.speed_btn.setMenu(speed_menu)
+        self.speed_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.repeat_btn = self._icon_button("repeat", "Repeat: off", checkable=True)
         self.repeat_btn.clicked.connect(self._cycle_repeat)
         self.mute_btn = self._icon_button("volume", "Mute (M)")
@@ -557,7 +650,7 @@ class PlayerWindow(QWidget):
         self.volume = QSlider(Qt.Orientation.Horizontal)
         self.volume.setObjectName("volume")
         self.volume.setRange(0, 100)
-        self.volume.setFixedWidth(96)
+        self.volume.setFixedWidth(80)
         self.volume.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.volume.setCursor(Qt.CursorShape.PointingHandCursor)
         self.volume.valueChanged.connect(self._volume_moved)
@@ -566,7 +659,8 @@ class PlayerWindow(QWidget):
         self.queue_btn.toggled.connect(self._toggle_queue)
         self.full_btn = self._icon_button("full", "Fullscreen (F)")
         self.full_btn.clicked.connect(self.toggle_fullscreen)
-        for widget in (self.repeat_btn, self.mute_btn, self.volume, self.queue_btn, self.full_btn):
+        for widget in (self.download_btn, self.shuffle_btn, self.repeat_btn, self.speed_btn,
+                       self.mute_btn, self.volume, self.queue_btn, self.full_btn):
             bar.addWidget(widget)
         cl.addLayout(bar)
         main.addWidget(self.controls)
@@ -582,6 +676,7 @@ class PlayerWindow(QWidget):
         self.queue_head = QLabel("UP NEXT")
         self.queue_head.setObjectName("queueHead")
         head.addWidget(self.queue_head, 1)
+        head.addWidget(self.radio_btn)
         open_btn = self._icon_button("open", "Add files to the queue (Ctrl+O)")
         open_btn.clicked.connect(self.open_files)
         head.addWidget(open_btn)
@@ -630,6 +725,9 @@ class PlayerWindow(QWidget):
             (Qt.Key.Key_F11, self.toggle_fullscreen),
             (Qt.Key.Key_Escape, self._leave_fullscreen),
             (Qt.Key.Key_Q, lambda: self.queue_btn.toggle()),
+            (Qt.Key.Key_S, lambda: self.shuffle_btn.toggle()),
+            (Qt.Key.Key_BracketLeft, lambda: self._step_speed(-1)),
+            (Qt.Key.Key_BracketRight, lambda: self._step_speed(1)),
             (Qt.Key.Key_Delete, self._remove_selected),
             (Qt.Key.Key_MediaNext, self.next),
             (Qt.Key.Key_MediaPrevious, self.previous),
@@ -756,6 +854,10 @@ class PlayerWindow(QWidget):
                                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(item.path).parent))))
             if item is not None and item.page_url.startswith("http"):
                 menu.addAction("Open the source page", lambda: QDesktopServices.openUrl(QUrl(item.page_url)))
+            if item is not None and video_id(item.webpage or item.page_url):
+                menu.addAction("Start radio from this", lambda: self.start_radio(item))
+            if item is not None and item.is_stream:
+                menu.addAction("Download", lambda: self._download_item(item))
             menu.addAction("Remove from the queue", self._remove_selected)
             menu.addSeparator()
         menu.addAction("Add files…", self.open_files)
@@ -830,6 +932,7 @@ class PlayerWindow(QWidget):
             return
         item.video_url, item.audio_url = data["video_url"], data["audio_url"]
         item.has_video = bool(data["has_video"])
+        item.webpage = data.get("webpage") or item.webpage
         item.resolved_at = time.time()
         if data.get("title") and (not item.title or item.title == item.page_url):
             item.title = data["title"]
@@ -853,6 +956,8 @@ class PlayerWindow(QWidget):
 
     def _load(self, source: QUrl, audio: QUrl | None = None) -> None:
         self._want_play = True
+        self.player.setPlaybackRate(self.rate)
+        self.companion.setPlaybackRate(self.rate)
         self._companion_active = audio is not None
         if audio is not None:
             self.companion.setSource(audio)
@@ -915,21 +1020,47 @@ class PlayerWindow(QWidget):
         self.time_label.setText("0:00")
         self.length_label.setText("0:00")
 
+    def _order(self) -> list[int]:
+        """Queue positions in the order they play: as listed, or shuffled."""
+        if not self.shuffle:
+            return list(range(len(self.items)))
+        keys = [item.key for item in self.items]
+        if sorted(self._shuffle_keys) != sorted(keys):
+            # New or removed entries: shuffle again, keeping what plays now first.
+            current = self.current.key if self.current in self.items else ""
+            rest = [key for key in keys if key != current]
+            random.shuffle(rest)
+            self._shuffle_keys = ([current] if current else []) + rest
+        position = {key: i for i, key in enumerate(keys)}
+        return [position[key] for key in self._shuffle_keys]
+
+    def _neighbour(self, step: int) -> int:
+        """The queue index [step] places away in play order, or -1 at either end."""
+        order = self._order()
+        if not order:
+            return -1
+        if self.current not in self.items:
+            return order[0]
+        at = order.index(self.items.index(self.current)) + step
+        if 0 <= at < len(order):
+            return order[at]
+        if self.repeat == "all":
+            return order[at % len(order)]
+        return -1
+
     def next(self) -> None:
-        if self.current in self.items:
-            index = self.items.index(self.current) + 1
-            if index >= len(self.items) and self.repeat == "all":
-                index = 0
+        index = self._neighbour(1)
+        if index >= 0:
             self.play_index(index)
+        elif self.current is not None:
+            self._autoplay_radio(play_next=True)
 
     def previous(self) -> None:
         # Like most players: back to the start first, then the previous item.
         if self.player.position() > 3000 or self.current not in self.items:
             self._seek_to(0)
             return
-        index = self.items.index(self.current) - 1
-        if index < 0 and self.repeat == "all":
-            index = len(self.items) - 1
+        index = self._neighbour(-1)
         if index >= 0:
             self.play_index(index)
         else:
@@ -1109,12 +1240,11 @@ class PlayerWindow(QWidget):
             self._seek_to(0)
             self.play()
             return
-        if self.current in self.items:
-            index = self.items.index(self.current) + 1
-            if index < len(self.items):
-                self.play_index(index)
-            elif self.repeat == "all" and self.items:
-                self.play_index(0)
+        index = self._neighbour(1)
+        if index >= 0:
+            self.play_index(index)
+        else:
+            self._autoplay_radio(play_next=True)
 
     def _error(self, _error: QMediaPlayer.Error, message: str) -> None:
         item = self.current
@@ -1180,7 +1310,11 @@ class PlayerWindow(QWidget):
         self.play_btn.setEnabled(bool(self.items))
         index = self.items.index(self.current) if self.current in self.items else -1
         self.prev_btn.setEnabled(index >= 0)
-        self.next_btn.setEnabled(0 <= index and (index < len(self.items) - 1 or self.repeat == "all"))
+        self.next_btn.setEnabled(0 <= index and (self._neighbour(1) >= 0 or self._can_autoplay()))
+        self.back_btn.setEnabled(index >= 0)
+        self.fwd_btn.setEnabled(index >= 0)
+        streaming = self.current is not None and self.current.is_stream
+        self.download_btn.setVisible(streaming)
         self.seek.setEnabled(self.player.isSeekable())
         if self.isFullScreen() and not playing:
             self._show_chrome()
@@ -1212,6 +1346,100 @@ class PlayerWindow(QWidget):
         silent = self.audio_out.isMuted() or self.volume.value() == 0
         self.mute_btn.setText(self._glyph("mute" if silent else "volume"))
         self.mute_btn.setToolTip("Unmute (M)" if silent else "Mute (M)")
+
+    # --------------------------------------------- shuffle, speed, radio
+    def _set_shuffle(self, on: bool) -> None:
+        self.shuffle = on
+        self._shuffle_keys = []
+        self.shuffle_btn.setToolTip("Shuffle: on (S)" if on else "Shuffle: off (S)")
+        self._update_controls()
+
+    def set_speed(self, rate: float) -> None:
+        self.rate = rate
+        self.player.setPlaybackRate(rate)
+        if self._companion_active:
+            self.companion.setPlaybackRate(rate)
+        self.speed_btn.setText(speed_label(rate))
+
+    def _step_speed(self, step: int) -> None:
+        at = min(range(len(SPEEDS)), key=lambda i: abs(SPEEDS[i] - self.rate))
+        self.set_speed(SPEEDS[max(0, min(len(SPEEDS) - 1, at + step))])
+
+    def _set_autoplay(self, on: bool) -> None:
+        self.autoplay = on
+        self.radio_btn.setToolTip("Autoplay: on. When the queue ends, similar songs keep playing"
+                                  if on else "Autoplay: off. Playback stops at the end of the queue")
+        self._update_controls()
+
+    def _can_autoplay(self) -> bool:
+        item = self.current
+        return bool(self.autoplay and item is not None and item.is_stream
+                    and video_id(item.webpage or item.page_url))
+
+    def _autoplay_radio(self, play_next: bool) -> None:
+        """At the end of the queue, with autoplay on, line up the last song's radio."""
+        if not self._can_autoplay():
+            return
+        item = self.current
+        if self._radio_seed == item.key:
+            return
+        self._fetch_radio(item, replace_rest=False, play_next=play_next)
+
+    def start_radio(self, item: PlayItem | None = None) -> None:
+        """Keep [item] (or what plays now) and replace what follows with its radio."""
+        item = item or self.current
+        if item is None:
+            return
+        if item is not self.current and item in self.items:
+            self.play_index(self.items.index(item))
+        self._fetch_radio(item, replace_rest=True, play_next=False)
+
+    def _fetch_radio(self, item: PlayItem, replace_rest: bool, play_next: bool) -> None:
+        vid = video_id(item.webpage or item.page_url)
+        if not vid:
+            return
+        self._radio_seed = item.key
+        self._radio_token += 1
+        self._radio_replace = replace_rest
+        self._radio_append_and_play = play_next
+        self.now_sub.setText("Finding songs like this…")
+        fetcher = RadioFetcher(self._radio_token, vid, self.logger)
+        fetcher.found.connect(lambda token, entries, it=item: self._radio_found(token, entries, it))
+        fetcher.finished.connect(lambda f=fetcher: self._resolvers.discard(f))
+        self._resolvers.add(fetcher)
+        fetcher.start()
+
+    def _radio_found(self, token: int, entries: list, seed: PlayItem) -> None:
+        if token != self._radio_token:
+            return
+        self.now_sub.setText(self._describe(self.current) if self.current else "")
+        known = {item.key for item in self.items}
+        fresh = [PlayItem(title=title, page_url=url, thumbnail=thumb, audio_only=seed.audio_only,
+                          subtitle="Radio · YouTube") for url, title, thumb in entries if url not in known]
+        if not fresh:
+            self.now_sub.setText("No similar songs were found.")
+            return
+        if self._radio_replace and seed in self.items:
+            del self.items[self.items.index(seed) + 1:]
+            self._shuffle_keys = []
+        start = len(self.items)
+        self.items.extend(fresh)
+        self._refresh_queue()
+        self._restyle_queue()
+        if self._radio_append_and_play:
+            self._radio_append_and_play = False
+            self.play_index(start)
+        else:
+            self._update_controls()
+
+    def _download_current(self) -> None:
+        if self.current is not None:
+            self._download_item(self.current)
+
+    def _download_item(self, item: PlayItem) -> None:
+        url = item.webpage or item.page_url
+        if url:
+            self.download_requested.emit(url, item.title)
 
     def _cycle_repeat(self) -> None:
         self.repeat = REPEAT_MODES[(REPEAT_MODES.index(self.repeat) + 1) % len(REPEAT_MODES)]

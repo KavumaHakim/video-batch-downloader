@@ -23,8 +23,8 @@ android {
         applicationId = "io.github.kavumahakim.vbd"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.9.0"
+        versionCode = 2
+        versionName = "0.10.0"
     }
 
     // yt-dlp ships with its own Python and FFmpeg per CPU type, which makes a
